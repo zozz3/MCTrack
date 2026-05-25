@@ -168,7 +168,7 @@ HSM_LTM:
     SCORE: {0: 0.1}
   # 一致性判断阈值，第一版要保守，不要删太狠
 CONSISTENCY:
-  ENABLE: True
+  ENABLE: False
   DEBUG: False
 
   DIR_THRE_DEG: {0: 45.0}
@@ -183,7 +183,7 @@ CONSISTENCY:
 
 # ---------------- group motion switch for exp2 ----------------
 GROUP_MOTION:
-  ENABLE: True
+  ENABLE: False
   # 至少多少条有效轨迹才判断群体运动
   MIN_TRACKS: 3
   # 速度太小的轨迹不参与方向判断，单位近似 m/s
@@ -193,4 +193,20 @@ GROUP_MOTION:
   # 至少多少比例轨迹方向接近群体主方向
   DIR_CONS_RATIO: 0.75
   # 开关日志
+  DEBUG: False
+
+OUTPUT_FILTER:
+  ENABLE: True
+  # 新生轨迹输出门槛
+  MIN_OUTPUT_TRACK_LENGTH: { 0: 3}
+  MIN_OUTPUT_SCORE: { 0: 0.40 }
+  # 远距离新生轨迹更严格
+  FAR_DIST: { 0: 50.0 }
+  FAR_MIN_OUTPUT_SCORE: { 0: 0.50 }
+  # 丢失轨迹最多输出几帧
+  MAX_LOST_OUTPUT_LENGTH: { 0: 1 }
+  #短轨迹的长度阈值
+  SHORT_TRAJ_LENGTH: { 0: 3 }
+  #短轨迹的平均分数阈值
+  SHORT_TRAJ_AVG_SCORE: { 0: 0.60 }
   DEBUG: False

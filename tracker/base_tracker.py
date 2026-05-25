@@ -7,7 +7,116 @@ import numpy as np
 from tracker.matching import *
 from tracker.trajectory import Trajectory
 from tracker.hsm_ltm import hsm_after_unmatch_update
+from tracker.group_motion_switch import detect_group_motion
 from utils.utils import norm_realative_radian
+
+
+
+def _cfg_by_cls(value, cls_id, default):
+    if isinstance(value, dict):
+        if cls_id in value:
+            return value[cls_id]
+        if str(cls_id) in value:
+            return value[str(cls_id)]
+        return default
+    if value is None:
+        return default
+    return value
+
+
+def _get_bbox_score(bbox):
+    for name in ["det_score", "score", "global_score", "confidence"]:
+        if hasattr(bbox, name):
+            try:
+                return float(getattr(bbox, name))
+            except Exception:
+                pass
+    return 1.0
+
+
+def _get_bbox_dist(bbox):
+    if hasattr(bbox, "global_xyz"):
+        xyz = np.asarray(bbox.global_xyz, dtype=float)
+        return float(np.linalg.norm(xyz[:2]))
+    if hasattr(bbox, "xyz"):
+        xyz = np.asarray(bbox.xyz, dtype=float)
+        return float(np.linalg.norm(xyz[:2]))
+    return 0.0
+
+
+def _get_traj_cls_id(traj, cfg):
+    """
+    尽量从 traj 或 bbox 里取类别。
+    KITTI car 一般就是 0。
+    """
+    category_map = cfg.get("CATEGORY_MAP_TO_NUMBER", {})
+
+    for obj in [traj, traj.bboxes[-1] if hasattr(traj, "bboxes") and len(traj.bboxes) > 0 else None]:
+        if obj is None:
+            continue
+
+        for name in ["category", "category_name", "det_name", "name"]:
+            if hasattr(obj, name):
+                cate = getattr(obj, name)
+                if cate in category_map:
+                    return int(category_map[cate])
+
+        for name in ["category_id", "label", "cls_id"]:
+            if hasattr(obj, name):
+                try:
+                    return int(getattr(obj, name))
+                except Exception:
+                    pass
+
+    return 0
+
+
+def should_output_traj_bbox_exp3(traj, bbox, cfg):
+    """
+    实验三：低质量轨迹输出抑制。
+    注意：只决定是否写入结果，不删除轨迹，不影响内部状态。
+    """
+    out_cfg = cfg.get("OUTPUT_FILTER", {})
+    if not out_cfg.get("ENABLE", False):
+        return True
+
+    cls_id = _get_traj_cls_id(traj, cfg)
+
+    min_len = int(_cfg_by_cls(out_cfg.get("MIN_OUTPUT_TRACK_LENGTH", {0: 3}), cls_id, 3))
+    min_score = float(_cfg_by_cls(out_cfg.get("MIN_OUTPUT_SCORE", {0: 0.55}), cls_id, 0.55))
+
+    far_dist = float(_cfg_by_cls(out_cfg.get("FAR_DIST", {0: 35.0}), cls_id, 35.0))
+    far_min_score = float(_cfg_by_cls(out_cfg.get("FAR_MIN_OUTPUT_SCORE", {0: 0.70}), cls_id, 0.70))
+
+    max_lost_output = int(_cfg_by_cls(out_cfg.get("MAX_LOST_OUTPUT_LENGTH", {0: 1}), cls_id, 1))
+
+    track_len = len(traj.bboxes) if hasattr(traj, "bboxes") else 1
+    score = _get_bbox_score(bbox)
+    dist = _get_bbox_dist(bbox)
+
+    unmatched_length = 0
+    for name in ["unmatched_length", "unmatch_length", "lost_time", "lost_frame", "time_since_update"]:
+        if hasattr(traj, name):
+            try:
+                unmatched_length = int(getattr(traj, name))
+                break
+            except Exception:
+                pass
+
+    # 规则1：短轨迹 + 低分，不输出
+    if track_len < min_len and score < min_score:
+        return False
+
+    # 规则2：远距离短轨迹更严格
+    if dist > far_dist and track_len < min_len and score < far_min_score:
+        return False
+
+    # 规则3：丢失太久的预测框不输出
+    # 注意：只是当前帧不输出，不删除轨迹
+    if unmatched_length > max_lost_output:
+        return False
+
+    return True
 
 
 class Base3DTracker:
@@ -163,13 +272,39 @@ class Base3DTracker:
 
     def get_output_trajs(self, frame_id):
         output_trajs = {}
+        output_filter_cfg = self.cfg.get("OUTPUT_FILTER", {})
+        output_filter_debug = output_filter_cfg.get("DEBUG", False)
+
         for track_id in list(self.all_trajs.keys()):
-            if self.all_trajs[track_id].status_flag == 1 or frame_id < 3:
-                bbox = self.all_trajs[track_id].bboxes[-1]
-                if bbox.det_score == self.all_trajs[track_id]._is_filter_predict_box:
+            traj = self.all_trajs[track_id]
+
+            if traj.status_flag == 1 or frame_id < 3:
+                bbox = traj.bboxes[-1]
+
+                # 原始 MCTrack 逻辑：过滤掉内部标记的预测框。
+                if bbox.det_score == traj._is_filter_predict_box:
                     continue
+
+                # 实验三：低质量轨迹输出抑制。
+                # 这里只影响输出，不删除轨迹，也不改变匹配和更新。
+                if not should_output_traj_bbox_exp3(traj, bbox, self.cfg):
+                    if output_filter_debug:
+                        track_len = len(traj.bboxes) if hasattr(traj, "bboxes") else 1
+                        score = _get_bbox_score(bbox)
+                        dist = _get_bbox_dist(bbox)
+                        print(
+                            "[OUTPUT_FILTER]",
+                            "frame=", frame_id,
+                            "track_id=", track_id,
+                            "track_len=", track_len,
+                            "score=", round(score, 3),
+                            "dist=", round(dist, 3),
+                        )
+                    continue
+
                 output_trajs[track_id] = bbox
-                self.all_trajs[track_id].is_output = True
+                traj.is_output = True
+
         return output_trajs
 
     def post_processing(self):
