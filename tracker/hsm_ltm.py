@@ -170,7 +170,78 @@ def _pos_res_threshold(lost_base_pos, cfg, cat):
     else:
         return float(_get_param(cfg, ["HSM_LTM", "CONSISTENCY", "POS_RES_THRE_FAR"], cat, 12.0))
 
+def _apply_group_prediction_to_fake_bbox(lost_traj, p_group, p_kf, cfg, cat):
+    """
+    用 HSM-LTM 群体运动预测轻量修正当前 fake bbox。
+    注意：这里只改当前 fake bbox 的位置，不直接改 Kalman 内部状态。
+    """
+    mode = str(
+        _get_param(
+            cfg,
+            ["HSM_LTM", "PREDICTION", "MODE"],
+            default="CHECK_ONLY",
+        )
+    )
 
+    enable = bool(
+        _get_param(
+            cfg,
+            ["HSM_LTM", "PREDICTION", "ENABLE"],
+            default=False,
+        )
+    )
+
+    if not enable or mode != "BLEND_GROUP":
+        return False
+
+    alpha = float(
+        _get_param(
+            cfg,
+            ["HSM_LTM", "PREDICTION", "GROUP_BLEND_ALPHA"],
+            cat,
+            0.2,
+        )
+    )
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+
+    p_group = np.asarray(p_group, dtype=float)
+    p_kf = np.asarray(p_kf, dtype=float)
+
+    p_final = p_kf + alpha * (p_group - p_kf)
+
+    bbox = lost_traj.bboxes[-1]
+
+    if hasattr(bbox, "global_xyz_lwh_yaw"):
+        bbox.global_xyz_lwh_yaw[0] = float(p_final[0])
+        bbox.global_xyz_lwh_yaw[1] = float(p_final[1])
+
+    if hasattr(bbox, "global_xyz_lwh_yaw_fusion"):
+        bbox.global_xyz_lwh_yaw_fusion[0] = float(p_final[0])
+        bbox.global_xyz_lwh_yaw_fusion[1] = float(p_final[1])
+
+    # 保存调试信息
+    bbox.hsm_pred_mode = "blend_group"
+    bbox.hsm_group_pred_x = float(p_group[0])
+    bbox.hsm_group_pred_y = float(p_group[1])
+    bbox.hsm_kf_pred_x = float(p_kf[0])
+    bbox.hsm_kf_pred_y = float(p_kf[1])
+    bbox.hsm_final_pred_x = float(p_final[0])
+    bbox.hsm_final_pred_y = float(p_final[1])
+    bbox.hsm_group_blend_alpha = float(alpha)
+
+    if bool(_get_param(cfg, ["HSM_LTM", "PREDICTION", "DEBUG"], default=False)):
+        print(
+            "[HSM_LTM][BLEND_GROUP]",
+            "track_id=", lost_traj.track_id,
+            "unmatch=", lost_traj.unmatch_length,
+            "alpha=", round(alpha, 3),
+            "kf=", np.round(p_kf, 3).tolist(),
+            "group=", np.round(p_group, 3).tolist(),
+            "final=", np.round(p_final, 3).tolist(),
+        )
+
+    return True
 def _build_reference_group(lost_traj, all_trajs, cfg):
     """
     Build historical similar-motion reference group for a lost trajectory.
@@ -425,6 +496,32 @@ def hsm_after_unmatch_update(lost_traj, all_trajs, cfg):
     if pos_err > pos_thre:
         abnormal_items += 1
         reasons.append(f"pos={pos_err:.2f}>{pos_thre:.2f}")
+    # ------------------------------------------------------------
+    # 新增：运动目标使用群体运动轻量修正 Kalman fake bbox
+    # ------------------------------------------------------------
+    only_blend_when_pos_normal = bool(
+        _get_param(
+            cfg,
+            ["HSM_LTM", "PREDICTION", "ONLY_BLEND_WHEN_POS_NORMAL"],
+            default=True,
+        )
+    )
+
+    can_blend = True
+
+    # 如果位置误差已经超过阈值，说明群体预测和 Kalman 预测冲突较大，
+    # 此时不融合，避免把轨迹拉偏。
+    if only_blend_when_pos_normal and pos_err > pos_thre:
+        can_blend = False
+
+    if can_blend:
+        _apply_group_prediction_to_fake_bbox(
+            lost_traj=lost_traj,
+            p_group=p_group,
+            p_kf=p_kf,
+            cfg=cfg,
+            cat=cat,
+        )
 
     # Save debug values on the current fake bbox.
     lost_traj.bboxes[-1].hsm_pos_error = float(pos_err)

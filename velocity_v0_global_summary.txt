@@ -1,0 +1,37 @@
+========== Velocity V0 Global BEV Analysis ==========
+dataset_root: data/kitti/datasets/tracking/training
+gt_dir: data/kitti/datasets/tracking/training/label_02
+pred_dir: results/kitti/20260526_093001/virconv/training/data
+fps: 10.0
+dist_thre: 2.0 m
+zero_eps: 0.0
+
+total_gt_items: 30601
+total_pred_items: 31627
+total_frame_matches: 27688
+usable_velocity_pairs: 27104
+
+Strict global static definition:
+static: ego-motion-compensated global BEV position exactly unchanged from previous frame
+moving: global BEV position changed by any amount
+
+static_count: 0
+moving_count: 27104
+
+mean_speed_abs_error_all: 0.479114 m/s
+mean_velocity_vec_error_all: 0.655076 m/s
+
+mean_speed_abs_error_static: 0.000000 m/s
+mean_speed_abs_error_moving: 0.479114 m/s
+mean_direction_error_moving: 34.687364 deg
+
+static_pred_nonzero_count: 0
+static_pred_nonzero_rate: 0.000000
+
+static_pred_speed_over_0.5_count: 0
+static_pred_speed_over_0.5_rate: 0.000000
+
+static_pred_speed_over_1.0_count: 0
+static_pred_speed_over_1.0_rate: 0.000000
+
+detail_csv: velocity_v0_global_detail.csv

@@ -142,7 +142,88 @@ class Trajectory:
         #         init_x=init_rvbox,
         #     )
 
+    def _get_bbox_bev_xy_for_static(self, bbox):
+        """
+        获取 bbox 的 BEV 中心点。
+        优先使用融合位置，其次使用原始位置。
+        """
+        for name in ["global_xyz_lwh_yaw_fusion", "global_xyz_lwh_yaw", "global_xyz"]:
+            if hasattr(bbox, name):
+                value = getattr(bbox, name)
+                if value is not None:
+                    arr = np.asarray(value, dtype=float)
+                    if arr.shape[0] >= 2:
+                        return arr[:2]
 
+        return None
+
+    def get_recent_displacements(self, history_len=3):
+        """
+        计算丢失前真实检测框的连续 BEV 位移。
+        注意：跳过 fake bbox，避免用 Kalman 预测框判断静止/运动。
+        """
+        real_bboxes = [
+            bbox for bbox in self.bboxes
+            if not getattr(bbox, "is_fake", False)
+        ]
+
+        if len(real_bboxes) < 2:
+            return []
+
+        recent = real_bboxes[-history_len:]
+
+        if len(recent) < 2:
+            return []
+
+        disps = []
+
+        for i in range(1, len(recent)):
+            prev_bbox = recent[i - 1]
+            curr_bbox = recent[i]
+
+            prev_xy = self._get_bbox_bev_xy_for_static(prev_bbox)
+            curr_xy = self._get_bbox_bev_xy_for_static(curr_bbox)
+
+            if prev_xy is None or curr_xy is None:
+                continue
+
+            frame_gap = curr_bbox.frame_id - prev_bbox.frame_id
+            if frame_gap <= 0:
+                frame_gap = 1
+
+            disp = float(np.linalg.norm(curr_xy - prev_xy)) / frame_gap
+            disps.append(disp)
+
+        return disps
+
+    def get_recent_displacement(self, history_len=3):
+        disps = self.get_recent_displacements(history_len)
+
+        if len(disps) == 0:
+            return None
+
+        return float(np.mean(disps))
+
+    def is_static_before_lost(
+            self,
+            history_len=3,
+            static_disp_thre=0.02,
+            require_all_static=True,
+    ):
+        """
+        严格静止判断：
+        只有丢失前连续真实检测框的位移都接近 0，才认为是静止候选。
+        低速目标仍然归为运动目标。
+        """
+        disps = self.get_recent_displacements(history_len)
+
+        if len(disps) == 0:
+            return False
+
+        if require_all_static:
+            return max(disps) <= static_disp_thre
+
+        return float(np.mean(disps)) <= static_disp_thre
     def get_measure(self, bbox: BBox, filter_flag="pose"):
         global_xyz = bbox.global_xyz
         global_yaw = bbox.global_yaw

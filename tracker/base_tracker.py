@@ -129,9 +129,100 @@ class Base3DTracker:
         self.cache_size = 3
         self.track_id_counter = 0
     def unmatch_update_with_hsm(self, track_id, frame_id):
-        self.all_trajs[track_id].unmatch_update(frame_id)
+        traj = self.all_trajs[track_id]
+
+        hsm_cfg = self.cfg.get("HSM_LTM", {})
+        motion_cfg = hsm_cfg.get("MOTION_STATE", {})
+
+        hsm_enable = bool(hsm_cfg.get("ENABLE", False))
+        motion_state_enable = bool(motion_cfg.get("ENABLE", False))
+
+        cls_id = getattr(traj, "category_num", 0)
+
+        is_static_before_lost = False
+
+        # 必须在 unmatch_update() 前判断
+        # 因为 unmatch_update() 会追加 Kalman fake bbox
+        if motion_state_enable:
+            history_window = int(
+                _cfg_by_cls(
+                    hsm_cfg.get("HISTORY_WINDOW", {0: 3}),
+                    cls_id,
+                    3,
+                )
+            )
+
+            static_disp_thre = float(
+                _cfg_by_cls(
+                    motion_cfg.get("STATIC_DISP_THRE", {0: 0.02}),
+                    cls_id,
+                    0.02,
+                )
+            )
+
+            require_all_static = bool(
+                motion_cfg.get("REQUIRE_ALL_STATIC", True)
+            )
+
+            is_static_before_lost = traj.is_static_before_lost(
+                history_len=history_window,
+                static_disp_thre=static_disp_thre,
+                require_all_static=require_all_static,
+            )
+
+        # 原始 Kalman unmatched 更新
+        traj.unmatch_update(frame_id)
+
+        if not hsm_enable:
+            return
+
+        start_unmatch_length = int(
+            _cfg_by_cls(
+                hsm_cfg.get("START_UNMATCH_LENGTH", {0: 1}),
+                cls_id,
+                1,
+            )
+        )
+
+        if traj.unmatch_length < start_unmatch_length:
+            return
+
+        # 静止目标：只保留 Kalman，不进入 HSM_LTM
+        if motion_state_enable and is_static_before_lost:
+            if motion_cfg.get("DEBUG", False):
+                print(
+                    "[HSM_LTM][MOTION_STATE]",
+                    "track_id=", track_id,
+                    "frame=", frame_id,
+                    "state=static",
+                    "action=kalman_only",
+                    "unmatch_length=", traj.unmatch_length,
+                )
+
+            if len(traj.bboxes) > 0:
+                traj.bboxes[-1].hsm_motion_state = "static"
+                traj.bboxes[-1].hsm_action = "kalman_only"
+
+            return
+
+        # 运动目标：沿用原 HSM_LTM 审查/删除逻辑
+        if motion_state_enable:
+            if len(traj.bboxes) > 0:
+                traj.bboxes[-1].hsm_motion_state = "moving"
+                traj.bboxes[-1].hsm_action = "original_hsm_ltm"
+
+            if motion_cfg.get("DEBUG", False):
+                print(
+                    "[HSM_LTM][MOTION_STATE]",
+                    "track_id=", track_id,
+                    "frame=", frame_id,
+                    "state=moving",
+                    "action=original_hsm_ltm",
+                    "unmatch_length=", traj.unmatch_length,
+                )
+
         hsm_after_unmatch_update(
-            lost_traj=self.all_trajs[track_id],
+            lost_traj=traj,
             all_trajs=self.all_trajs,
             cfg=self.cfg,
         )
@@ -272,8 +363,6 @@ class Base3DTracker:
 
     def get_output_trajs(self, frame_id):
         output_trajs = {}
-        output_filter_cfg = self.cfg.get("OUTPUT_FILTER", {})
-        output_filter_debug = output_filter_cfg.get("DEBUG", False)
 
         for track_id in list(self.all_trajs.keys()):
             traj = self.all_trajs[track_id]
@@ -281,32 +370,29 @@ class Base3DTracker:
             if traj.status_flag == 1 or frame_id < 3:
                 bbox = traj.bboxes[-1]
 
-                # 原始 MCTrack 逻辑：过滤掉内部标记的预测框。
+                # 保留原始 MCTrack 的预测框过滤逻辑
                 if bbox.det_score == traj._is_filter_predict_box:
                     continue
 
-                # 实验三：低质量轨迹输出抑制。
-                # 这里只影响输出，不删除轨迹，也不改变匹配和更新。
-                if not should_output_traj_bbox_exp3(traj, bbox, self.cfg):
-                    if output_filter_debug:
-                        track_len = len(traj.bboxes) if hasattr(traj, "bboxes") else 1
-                        score = _get_bbox_score(bbox)
-                        dist = _get_bbox_dist(bbox)
-                        print(
-                            "[OUTPUT_FILTER]",
-                            "frame=", frame_id,
-                            "track_id=", track_id,
-                            "track_len=", track_len,
-                            "score=", round(score, 3),
-                            "dist=", round(dist, 3),
-                        )
-                    continue
+                # ------------------------------------------------------------
+                # 实验四：新生轨迹延迟确认
+                # ------------------------------------------------------------
+                # 如果这条轨迹以前已经输出过，说明它已经被确认过，
+                # 后续不再用 OUTPUT_FILTER 卡它，避免增加 FN 和 Frag。
+                #
+                # 如果这条轨迹以前从未输出过，才使用实验三的输出过滤，
+                # 防止短轨迹、低分、远距离假阳性直接进入结果。
+                # ------------------------------------------------------------
+                already_confirmed = getattr(traj, "is_output", False)
+
+                if not already_confirmed:
+                    if not should_output_traj_bbox_exp3(traj, bbox, self.cfg):
+                        continue
 
                 output_trajs[track_id] = bbox
                 traj.is_output = True
 
         return output_trajs
-
     def post_processing(self):
         trajs = {}
         for track_id in self.all_dead_trajs.keys():
