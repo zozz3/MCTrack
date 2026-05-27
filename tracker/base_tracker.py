@@ -10,6 +10,195 @@ from tracker.hsm_ltm import hsm_after_unmatch_update
 from tracker.group_motion_switch import detect_group_motion
 from utils.utils import norm_realative_radian
 
+def _get_value(obj, names, default=None):
+    """
+    同时兼容 dict 和 object。
+    MCTrack 不同版本里 detection 可能是 dict，也可能是 BBox 对象。
+    """
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _get_2d_box_from_det(det):
+    """
+    尽量从 detection 中取 2D bbox。
+    返回 [x1, y1, x2, y2]。
+
+    兼容 MCTrack 中常见的 BBox 对象字段：
+    - x1y1x2y2
+    - x1y1x2y2_fusion
+    - x1y1x2y2_predict
+    也兼容 dict 形式的 bbox_image / box2d。
+    """
+
+    # 情况 1：det 直接有 2D bbox 字段
+    for key in [
+        "box2d",
+        "bbox2d",
+        "bbox_image",
+        "image_bbox",
+        "x1y1x2y2",
+        "x1y1x2y2_fusion",
+        "x1y1x2y2_predict",
+    ]:
+        val = _get_value(det, [key], None)
+
+        if val is None:
+            continue
+
+        if isinstance(val, np.ndarray):
+            val = val.reshape(-1).tolist()
+
+        if isinstance(val, (list, tuple)) and len(val) >= 4:
+            arr = [float(v) for v in val[:4]]
+            if np.all(np.isfinite(arr)):
+                return arr
+
+        if isinstance(val, dict):
+            if "x1y1x2y2" in val:
+                box = val["x1y1x2y2"]
+                if isinstance(box, np.ndarray):
+                    box = box.reshape(-1).tolist()
+                if isinstance(box, (list, tuple)) and len(box) >= 4:
+                    arr = [float(v) for v in box[:4]]
+                    if np.all(np.isfinite(arr)):
+                        return arr
+
+            for _, sub_val in val.items():
+                if isinstance(sub_val, dict) and "x1y1x2y2" in sub_val:
+                    box = sub_val["x1y1x2y2"]
+                    if isinstance(box, np.ndarray):
+                        box = box.reshape(-1).tolist()
+                    if isinstance(box, (list, tuple)) and len(box) >= 4:
+                        arr = [float(v) for v in box[:4]]
+                        if np.all(np.isfinite(arr)):
+                            return arr
+
+    # 情况 2：det 里直接有 x1 y1 x2 y2
+    x1 = _get_value(det, ["x1"], None)
+    y1 = _get_value(det, ["y1"], None)
+    x2 = _get_value(det, ["x2"], None)
+    y2 = _get_value(det, ["y2"], None)
+
+    if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+        arr = [float(x1), float(y1), float(x2), float(y2)]
+        if np.all(np.isfinite(arr)):
+            return arr
+
+    return None
+
+
+def _is_full_image_abnormal_box(
+    det,
+    img_w=1242.0,
+    img_h=375.0,
+    edge_margin=5.0,
+    min_width_ratio=0.95,
+    min_height_ratio=0.90,
+    min_area_ratio=0.85,
+):
+    """
+    判断是否为全图异常检测框。
+
+    屏蔽条件：
+    1. bbox 几乎覆盖整张图像；
+    或者
+    2. bbox 至少三条边贴近图像边界。
+
+    注意：这里只是在 tracker 内部软屏蔽 detection，不修改原始 VirConv 检测文件。
+    """
+
+    box = _get_2d_box_from_det(det)
+
+    if box is None:
+        return False
+
+    x1, y1, x2, y2 = box
+
+    bw = max(0.0, x2 - x1)
+    bh = max(0.0, y2 - y1)
+
+    if bw <= 0 or bh <= 0:
+        return False
+
+    width_ratio = bw / float(img_w)
+    height_ratio = bh / float(img_h)
+    area_ratio = (bw * bh) / float(img_w * img_h)
+
+    touch_left = x1 <= edge_margin
+    touch_top = y1 <= edge_margin
+    touch_right = x2 >= float(img_w) - edge_margin
+    touch_bottom = y2 >= float(img_h) - edge_margin
+
+    touch_edge_count = (
+        int(touch_left)
+        + int(touch_top)
+        + int(touch_right)
+        + int(touch_bottom)
+    )
+
+    near_full_image = (
+        width_ratio >= min_width_ratio
+        and height_ratio >= min_height_ratio
+        and area_ratio >= min_area_ratio
+    )
+
+    touch_three_edges = touch_edge_count >= 3
+
+    return bool(near_full_image or touch_three_edges)
+
+
+def _soft_ignore_full_image_dets(
+    dets,
+    img_w=1242.0,
+    img_h=375.0,
+    edge_margin=5.0,
+    min_width_ratio=0.95,
+    min_height_ratio=0.90,
+    min_area_ratio=0.85,
+    debug=False,
+    frame_id=None,
+):
+    """
+    不删除原始检测，只是在 tracker 内部屏蔽异常全图框。
+    返回：
+    - valid_dets: 正常进入 tracking 的检测
+    - ignored_dets: 被软屏蔽的检测
+    """
+
+    valid_dets = []
+    ignored_dets = []
+
+    for det in dets:
+        if _is_full_image_abnormal_box(
+            det,
+            img_w=img_w,
+            img_h=img_h,
+            edge_margin=edge_margin,
+            min_width_ratio=min_width_ratio,
+            min_height_ratio=min_height_ratio,
+            min_area_ratio=min_area_ratio,
+        ):
+            ignored_dets.append(det)
+            continue
+
+        valid_dets.append(det)
+
+    if debug and len(ignored_dets) > 0:
+        print(
+            "[FullImageBBoxSoftIgnore]",
+            "frame=", frame_id,
+            "ignored=", len(ignored_dets),
+            "valid=", len(valid_dets),
+            "image_wh=", [int(img_w), int(img_h)],
+            "edge_margin=", edge_margin,
+        )
+
+    return valid_dets, ignored_dets
 
 
 def _cfg_by_cls(value, cls_id, default):
@@ -138,6 +327,10 @@ class Base3DTracker:
             "boundary_checked": 0,
             "small_ratio_candidate": 0,
             "min_remain_ratio": 999.0,
+        }
+        self.full_image_bbox_ignore_stats = {
+            "checked_frames": 0,
+            "ignored": 0,
         }
 
     def _get_exp5a_cfg(self):
@@ -434,20 +627,27 @@ class Base3DTracker:
 
     def _print_exp5a_summary(self):
         cfg = self._get_exp5a_cfg()
-        if not bool(cfg.get("PRINT_SUMMARY", True)):
-            return
-        print(
-            "[EXP5A_SUMMARY]",
-            "checked=", self.exp5a_stats.get("checked", 0),
-            "ref_update=", self.exp5a_stats.get("ref_update", 0),
-            "terminated=", self.exp5a_stats.get("terminated", 0),
-            "no_bbox_image=", self.exp5a_stats.get("no_bbox_image", 0),
-            "no_ref_when_checked=", self.exp5a_stats.get("no_ref_when_checked", 0),
-            "skip_fake=", self.exp5a_stats.get("skip_fake", 0),
-            "boundary_checked=", self.exp5a_stats.get("boundary_checked", 0),
-            "small_ratio_candidate=", self.exp5a_stats.get("small_ratio_candidate", 0),
-            "min_remain_ratio=", round(float(self.exp5a_stats.get("min_remain_ratio", 999.0)), 4),
-        )
+        if bool(cfg.get("PRINT_SUMMARY", True)):
+            print(
+                "[EXP5A_SUMMARY]",
+                "checked=", self.exp5a_stats.get("checked", 0),
+                "ref_update=", self.exp5a_stats.get("ref_update", 0),
+                "terminated=", self.exp5a_stats.get("terminated", 0),
+                "no_bbox_image=", self.exp5a_stats.get("no_bbox_image", 0),
+                "no_ref_when_checked=", self.exp5a_stats.get("no_ref_when_checked", 0),
+                "skip_fake=", self.exp5a_stats.get("skip_fake", 0),
+                "boundary_checked=", self.exp5a_stats.get("boundary_checked", 0),
+                "small_ratio_candidate=", self.exp5a_stats.get("small_ratio_candidate", 0),
+                "min_remain_ratio=", round(float(self.exp5a_stats.get("min_remain_ratio", 999.0)), 4),
+            )
+
+        full_image_cfg = self.cfg.get("FULL_IMAGE_BBOX_SOFT_IGNORE", {})
+        if bool(full_image_cfg.get("PRINT_SUMMARY", True)):
+            print(
+                "[FULL_IMAGE_BBOX_SOFT_IGNORE_SUMMARY]",
+                "checked_frames=", self.full_image_bbox_ignore_stats.get("checked_frames", 0),
+                "ignored=", self.full_image_bbox_ignore_stats.get("ignored", 0),
+            )
 
     def unmatch_update_with_hsm(self, track_id, frame_id):
         traj = self.all_trajs[track_id]
@@ -568,6 +768,53 @@ class Base3DTracker:
                 output_trajs: Updated trajectories after performing tracking and matching for the current frame.
         """
         self.predict_before_associate()
+
+        # ------------------------------------------------------------
+        # 实验五E-1：全图异常检测框软屏蔽
+        # ------------------------------------------------------------
+        # 原始 VirConv 检测文件不做任何修改。
+        # 这里只在 tracker 当前帧内部屏蔽异常框，使其不参与：
+        # 1) BEV/RV 数据关联；
+        # 2) 已有轨迹 update；
+        # 3) 新生轨迹初始化；
+        # 4) 最终输出。
+        #
+        # 屏蔽条件：
+        # - bbox 几乎覆盖整张图像；
+        # - 或 bbox 至少三条边贴近图像边界。
+        # ------------------------------------------------------------
+        full_image_cfg = self.cfg.get("FULL_IMAGE_BBOX_SOFT_IGNORE", {})
+        if bool(full_image_cfg.get("ENABLE", True)):
+            image_w, image_h = self._get_image_shape_exp5a(
+                bbox=None,
+                frame_info=frame_info,
+            )
+            image_w = float(full_image_cfg.get("IMAGE_WIDTH", image_w))
+            image_h = float(full_image_cfg.get("IMAGE_HEIGHT", image_h))
+
+            valid_bboxes, ignored_full_image_bboxes = _soft_ignore_full_image_dets(
+                frame_info.bboxes,
+                img_w=image_w,
+                img_h=image_h,
+                edge_margin=float(full_image_cfg.get("EDGE_MARGIN", 5.0)),
+                min_width_ratio=float(full_image_cfg.get("MIN_WIDTH_RATIO", 0.95)),
+                min_height_ratio=float(full_image_cfg.get("MIN_HEIGHT_RATIO", 0.90)),
+                min_area_ratio=float(full_image_cfg.get("MIN_AREA_RATIO", 0.85)),
+                debug=bool(full_image_cfg.get("DEBUG", False)),
+                frame_id=getattr(frame_info, "frame_id", None),
+            )
+
+            self.full_image_bbox_ignore_stats["checked_frames"] = (
+                self.full_image_bbox_ignore_stats.get("checked_frames", 0) + 1
+            )
+            self.full_image_bbox_ignore_stats["ignored"] = (
+                self.full_image_bbox_ignore_stats.get("ignored", 0)
+                + len(ignored_full_image_bboxes)
+            )
+
+            # 软屏蔽：只改当前 tracker 运行时使用的 detection 列表。
+            # 不改 base_version json，不改原始 VirConv 文件。
+            frame_info.bboxes = valid_bboxes
 
         trajs = self.get_trajectory_bbox(self.all_trajs)
         trajs_cnt, dets_cnt = len(trajs), len(frame_info.bboxes)
