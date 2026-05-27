@@ -175,7 +175,7 @@ HSM_LTM:
     MOVING_PRED_MODE: "ORIGINAL_HSM_LTM"
 
     # 打印调试信息，方便看有多少轨迹进入静止分支/运动分支
-    DEBUG: True
+    DEBUG: False
 
   # 参考车辆筛选条件
   # 注意：这里是给“运动目标使用 HSM_LTM 时”筛选参考车辆用的
@@ -248,16 +248,23 @@ GROUP_MOTION:
 
 OUTPUT_FILTER:
   ENABLE: True
-
   MIN_OUTPUT_TRACK_LENGTH: { 0: 3}
   MIN_OUTPUT_SCORE: { 0: 0.40 }
-
   FAR_DIST: { 0: 50.0 }
   FAR_MIN_OUTPUT_SCORE: { 0: 0.50 }
-
   MAX_LOST_OUTPUT_LENGTH: { 0: 1 }
-
   SHORT_TRAJ_LENGTH: { 0: 3 }
   SHORT_TRAJ_AVG_SCORE: { 0: 0.60 }
-
   DEBUG: False
+EXP5A_OUT_OF_VIEW:
+  ENABLE: True
+  PRINT_SUMMARY: True
+  DEBUG: False
+
+  IMAGE_WIDTH: 1242
+  IMAGE_HEIGHT: 375
+  REMAIN_RATIO_THRE: {0: 0.435}
+  MIN_REF_AREA: {0: 80.0}
+
+  REQUIRE_BOUNDARY_TOUCH: True
+  BOUNDARY_MARGIN: 0

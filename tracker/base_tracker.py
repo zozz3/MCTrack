@@ -128,6 +128,327 @@ class Base3DTracker:
         self.id_seed = 0
         self.cache_size = 3
         self.track_id_counter = 0
+        self.exp5a_stats = {
+            "checked": 0,
+            "ref_update": 0,
+            "terminated": 0,
+            "no_bbox_image": 0,
+            "no_ref_when_checked": 0,
+            "skip_fake": 0,
+            "boundary_checked": 0,
+            "small_ratio_candidate": 0,
+            "min_remain_ratio": 999.0,
+        }
+
+    def _get_exp5a_cfg(self):
+        return self.cfg.get("EXP5A_OUT_OF_VIEW", {})
+
+    def _exp5a_enabled(self):
+        return bool(self._get_exp5a_cfg().get("ENABLE", True))
+
+    def _get_bbox_image_xyxy_exp5a(self, bbox):
+        """
+        实验五A v6：直接使用检测结果自带的 2D bbox。
+        这样不再依赖 camera transform / 3D 投影，避免 no_image_info 全部命中的问题。
+        MCTrack 的 BBox 初始化时已经从 bbox_image 里保存了 x1y1x2y2。
+        """
+        for name in ["x1y1x2y2", "x1y1x2y2_fusion", "x1y1x2y2_predict"]:
+            if hasattr(bbox, name):
+                value = getattr(bbox, name)
+                if value is None:
+                    continue
+                arr = np.asarray(value, dtype=float).reshape(-1)
+                if arr.shape[0] >= 4 and np.all(np.isfinite(arr[:4])):
+                    x1, y1, x2, y2 = arr[:4].tolist()
+                    if x2 > x1 and y2 > y1:
+                        return float(x1), float(y1), float(x2), float(y2)
+        return None
+
+    def _get_camera_type_exp5a(self, bbox):
+        """
+        尽量从 BBox 中读取 camera_type。
+        MCTrack 的原始 json 是 bbox_image.camera_type，运行时 BBox 通常会展开成 bbox.camera_type。
+        """
+        if bbox is None:
+            return None
+
+        for name in ["camera_type", "camera_name", "cam_type"]:
+            if hasattr(bbox, name):
+                value = getattr(bbox, name)
+                if value is not None:
+                    return value
+
+        if hasattr(bbox, "bbox_image"):
+            bbox_image = getattr(bbox, "bbox_image")
+            if isinstance(bbox_image, dict):
+                return bbox_image.get("camera_type", None)
+
+        return None
+
+    def _get_image_shape_exp5a(self, bbox=None, frame_info=None):
+        """
+        优先从当前帧 transform_matrix.cameras_transform_matrix[camera_type].image_shape 读取真实图像尺寸。
+        只有读取不到时，才退回 yaml 里的 IMAGE_WIDTH / IMAGE_HEIGHT。
+        """
+        cfg = self._get_exp5a_cfg()
+
+        if frame_info is not None and hasattr(frame_info, "transform_matrix"):
+            transform_matrix = getattr(frame_info, "transform_matrix")
+            if isinstance(transform_matrix, dict):
+                cameras = transform_matrix.get("cameras_transform_matrix", None)
+                cam_type = self._get_camera_type_exp5a(bbox)
+
+                if isinstance(cameras, dict) and len(cameras) > 0:
+                    cam_info = None
+                    if cam_type in cameras:
+                        cam_info = cameras[cam_type]
+                    elif cam_type is None:
+                        # 没有 camera_type 时，退回第一个相机。
+                        cam_info = cameras[list(cameras.keys())[0]]
+
+                    if isinstance(cam_info, dict) and "image_shape" in cam_info:
+                        shape = cam_info["image_shape"]
+                        if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                            a = int(shape[0])
+                            b = int(shape[1])
+                            # 常见格式是 [height, width]，例如 [375, 1242] 或 [900, 1600]。
+                            # 如果反过来，也做一次兼容。
+                            if a <= b:
+                                image_h, image_w = a, b
+                            else:
+                                image_w, image_h = a, b
+                            return image_w, image_h
+
+        image_w = int(cfg.get("IMAGE_WIDTH", 1242))
+        image_h = int(cfg.get("IMAGE_HEIGHT", 375))
+        return image_w, image_h
+
+    def _get_bbox_2d_area_info_exp5a(self, bbox, frame_info=None):
+        xyxy = self._get_bbox_image_xyxy_exp5a(bbox)
+        if xyxy is None:
+            return None
+
+        x1, y1, x2, y2 = xyxy
+        image_w, image_h = self._get_image_shape_exp5a(bbox=bbox, frame_info=frame_info)
+
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+        cfg = self._get_exp5a_cfg()
+        out_margin = float(cfg.get("OUT_BOUNDARY_MARGIN", cfg.get("BOUNDARY_MARGIN", 5.0)))
+        ref_margin = float(cfg.get("REF_BOUNDARY_MARGIN", 20.0))
+
+        touch_left = x1 <= out_margin
+        touch_top = y1 <= out_margin
+        touch_right = x2 >= float(image_w - 1) - out_margin
+        touch_bottom = y2 >= float(image_h - 1) - out_margin
+        touches_boundary = touch_left or touch_top or touch_right or touch_bottom
+
+        ref_touch_left = x1 <= ref_margin
+        ref_touch_top = y1 <= ref_margin
+        ref_touch_right = x2 >= float(image_w - 1) - ref_margin
+        ref_touch_bottom = y2 >= float(image_h - 1) - ref_margin
+        touches_ref_boundary = ref_touch_left or ref_touch_top or ref_touch_right or ref_touch_bottom
+
+        return {
+            "x1": float(x1),
+            "y1": float(y1),
+            "x2": float(x2),
+            "y2": float(y2),
+            "area": float(area),
+            "image_w": int(image_w),
+            "image_h": int(image_h),
+            "touches_boundary": bool(touches_boundary),
+            "touch_left": bool(touch_left),
+            "touch_top": bool(touch_top),
+            "touch_right": bool(touch_right),
+            "touch_bottom": bool(touch_bottom),
+            "touches_ref_boundary": bool(touches_ref_boundary),
+            "ref_touch_left": bool(ref_touch_left),
+            "ref_touch_top": bool(ref_touch_top),
+            "ref_touch_right": bool(ref_touch_right),
+            "ref_touch_bottom": bool(ref_touch_bottom),
+        }
+
+    def _update_full_vehicle_reference_exp5a(self, traj, frame_info=None, source="matched"):
+        """
+        记录该轨迹历史上“完整车辆”的 2D bbox 面积。
+        只用真实检测框，不用 fake bbox；贴边框不作为完整参考。
+        """
+        if not self._exp5a_enabled():
+            return False
+        if traj is None or len(traj.bboxes) == 0:
+            return False
+
+        bbox = traj.bboxes[-1]
+        if getattr(bbox, "is_fake", False):
+            self.exp5a_stats["skip_fake"] = self.exp5a_stats.get("skip_fake", 0) + 1
+            return False
+
+        info = self._get_bbox_2d_area_info_exp5a(bbox, frame_info)
+        if info is None:
+            self.exp5a_stats["no_bbox_image"] = self.exp5a_stats.get("no_bbox_image", 0) + 1
+            return False
+
+        cls_id = getattr(traj, "category_num", 0)
+        cfg = self._get_exp5a_cfg()
+        min_ref_area = float(_cfg_by_cls(cfg.get("MIN_REF_AREA", {0: 80.0}), cls_id, 80.0))
+
+        # 贴近边界时可能已经是不完整车辆，不能拿来记录“完整车辆大小”。
+        # 注意这里用 REF_BOUNDARY_MARGIN，默认比真正删除用的 OUT_BOUNDARY_MARGIN 更大。
+        if info.get("touches_ref_boundary", info["touches_boundary"]):
+            return False
+        if info["area"] < min_ref_area:
+            return False
+
+        # v6 核心：每条轨迹只保留一张“历史最大完整参考框”。
+        # 如果当前候选框面积没有超过已有参考面积，完全不更新 ref_area / ref_frame / ref_xyxy。
+        # 这样不会在轨迹里保存多张参考面积，也不会让较小框覆盖真正的最大完整车框。
+        old_ref = float(getattr(traj, "exp5a_full_vehicle_ref_area", 0.0))
+        cur_area = float(info["area"])
+
+        bbox.exp5a_full_vehicle_ref_area = old_ref
+        bbox.exp5a_ref_update = False
+
+        if cur_area <= old_ref:
+            return False
+
+        traj.exp5a_full_vehicle_ref_area = cur_area
+        traj.exp5a_full_vehicle_ref_frame = getattr(frame_info, "frame_id", -1) if frame_info is not None else -1
+        traj.exp5a_full_vehicle_ref_source = source
+        traj.exp5a_full_vehicle_ref_xyxy = [info["x1"], info["y1"], info["x2"], info["y2"]]
+        traj.exp5a_full_vehicle_ref_image_wh = [info["image_w"], info["image_h"]]
+
+        bbox.exp5a_full_vehicle_ref_area = cur_area
+        bbox.exp5a_ref_update = True
+        bbox.exp5a_full_vehicle_ref_xyxy = traj.exp5a_full_vehicle_ref_xyxy
+
+        self.exp5a_stats["ref_update"] = self.exp5a_stats.get("ref_update", 0) + 1
+        if bool(cfg.get("DEBUG", False)):
+            print(
+                "[EXP5A_REF_UPDATE_MAX]",
+                "track_id=", traj.track_id,
+                "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                "source=", source,
+                "old_ref=", round(old_ref, 2),
+                "new_max_ref=", round(cur_area, 2),
+                "bbox_area=", round(cur_area, 2),
+                "xyxy=", [round(info["x1"], 1), round(info["y1"], 1), round(info["x2"], 1), round(info["y2"], 1)],
+                "image_wh=", [info["image_w"], info["image_h"]],
+            )
+
+        return True
+
+    def _apply_out_of_view_termination_exp5a(self, traj, frame_info=None, source="matched"):
+        """
+        实验五A v6：完整车辆参考面积法。
+        当当前 2D bbox 面积 <= 历史完整车辆面积的 10%，且当前框贴到图像边界，
+        认为车辆整体约 90% 已经出界，只剩车尾/车屁股，终止轨迹并不输出当前 bbox。
+        """
+        if not self._exp5a_enabled():
+            return False
+        if traj is None or len(traj.bboxes) == 0:
+            return False
+
+        bbox = traj.bboxes[-1]
+
+        # 这个 v4 只处理真实检测框。fake bbox 没有当前真实 2D bbox，不能用旧框误判。
+        if getattr(bbox, "is_fake", False):
+            self.exp5a_stats["skip_fake"] = self.exp5a_stats.get("skip_fake", 0) + 1
+            return False
+
+        self.exp5a_stats["checked"] = self.exp5a_stats.get("checked", 0) + 1
+
+        info = self._get_bbox_2d_area_info_exp5a(bbox, frame_info)
+        if info is None:
+            self.exp5a_stats["no_bbox_image"] = self.exp5a_stats.get("no_bbox_image", 0) + 1
+            return False
+
+        ref_area = float(getattr(traj, "exp5a_full_vehicle_ref_area", 0.0))
+        if ref_area <= 1e-6:
+            self.exp5a_stats["no_ref_when_checked"] = self.exp5a_stats.get("no_ref_when_checked", 0) + 1
+            return False
+
+        cls_id = getattr(traj, "category_num", 0)
+        cfg = self._get_exp5a_cfg()
+        remain_ratio_thre = float(_cfg_by_cls(cfg.get("REMAIN_RATIO_THRE", {0: 0.10}), cls_id, 0.10))
+        require_boundary = bool(cfg.get("REQUIRE_BOUNDARY_TOUCH", True))
+
+        remaining_ratio = float(info["area"] / max(ref_area, 1e-6))
+        boundary_ok = (not require_boundary) or bool(info["touches_boundary"])
+
+        self.exp5a_stats["min_remain_ratio"] = min(
+            float(self.exp5a_stats.get("min_remain_ratio", 999.0)),
+            float(remaining_ratio),
+        )
+        if bool(info["touches_boundary"]):
+            self.exp5a_stats["boundary_checked"] = self.exp5a_stats.get("boundary_checked", 0) + 1
+        if remaining_ratio <= float(cfg.get("DEBUG_RATIO_THRE", 0.30)):
+            self.exp5a_stats["small_ratio_candidate"] = self.exp5a_stats.get("small_ratio_candidate", 0) + 1
+            if bool(cfg.get("DEBUG_CANDIDATE", False)):
+                print(
+                    "[EXP5A_CANDIDATE]",
+                    "track_id=", traj.track_id,
+                    "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                    "source=", source,
+                    "current_area=", round(float(info["area"]), 2),
+                    "ref_area=", round(float(ref_area), 2),
+                    "remain_ratio=", round(float(remaining_ratio), 4),
+                    "touch_boundary=", info["touches_boundary"],
+                    "xyxy=", [round(info["x1"], 1), round(info["y1"], 1), round(info["x2"], 1), round(info["y2"], 1)],
+                    "image_wh=", [info["image_w"], info["image_h"]],
+                )
+
+        bbox.exp5a_current_2d_area = float(info["area"])
+        bbox.exp5a_full_vehicle_ref_area = float(ref_area)
+        bbox.exp5a_full_vehicle_ref_xyxy = getattr(traj, "exp5a_full_vehicle_ref_xyxy", None)
+        bbox.exp5a_remaining_ratio_to_ref = float(remaining_ratio)
+        bbox.exp5a_touches_boundary = bool(info["touches_boundary"])
+        bbox.exp5a_bbox_xyxy = [info["x1"], info["y1"], info["x2"], info["y2"]]
+
+        if remaining_ratio <= remain_ratio_thre and boundary_ok:
+            bbox.det_score = traj._is_filter_predict_box
+            bbox.exp5a_is_out_of_view = True
+            bbox.exp5a_out_view_source = source
+            bbox.exp5a_out_view_reason = "2d_area_le_10_percent_of_reference_and_touch_boundary"
+
+            traj.status_flag = 4
+            traj.exp5a_delete_reason = "real_out_of_view_" + str(source)
+            self.exp5a_stats["terminated"] = self.exp5a_stats.get("terminated", 0) + 1
+
+            if bool(cfg.get("DEBUG", False)):
+                print(
+                    "[EXP5A_OUT_OF_VIEW]",
+                    "track_id=", traj.track_id,
+                    "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                    "source=", source,
+                    "current_area=", round(float(info["area"]), 2),
+                    "ref_area=", round(float(ref_area), 2),
+                    "remain_ratio=", round(float(remaining_ratio), 4),
+                    "touch_boundary=", info["touches_boundary"],
+                    "xyxy=", [round(info["x1"], 1), round(info["y1"], 1), round(info["x2"], 1), round(info["y2"], 1)],
+                    "image_wh=", [info["image_w"], info["image_h"]],
+                )
+            return True
+
+        return False
+
+    def _print_exp5a_summary(self):
+        cfg = self._get_exp5a_cfg()
+        if not bool(cfg.get("PRINT_SUMMARY", True)):
+            return
+        print(
+            "[EXP5A_SUMMARY]",
+            "checked=", self.exp5a_stats.get("checked", 0),
+            "ref_update=", self.exp5a_stats.get("ref_update", 0),
+            "terminated=", self.exp5a_stats.get("terminated", 0),
+            "no_bbox_image=", self.exp5a_stats.get("no_bbox_image", 0),
+            "no_ref_when_checked=", self.exp5a_stats.get("no_ref_when_checked", 0),
+            "skip_fake=", self.exp5a_stats.get("skip_fake", 0),
+            "boundary_checked=", self.exp5a_stats.get("boundary_checked", 0),
+            "small_ratio_candidate=", self.exp5a_stats.get("small_ratio_candidate", 0),
+            "min_remain_ratio=", round(float(self.exp5a_stats.get("min_remain_ratio", 999.0)), 4),
+        )
+
     def unmatch_update_with_hsm(self, track_id, frame_id):
         traj = self.all_trajs[track_id]
 
@@ -284,6 +605,15 @@ class Base3DTracker:
                 self.all_trajs[track_id].update(
                     frame_info.bboxes[match_res[indexes, 1][0]], cost_matrix[indexes][0]
                 )
+                # 实验五A v6：先用历史完整面积判断当前框是否已经只剩车尾/车屁股。
+                # 如果没有删除，再把当前非贴边大框更新为新的完整参考面积。
+                exp5a_deleted = self._apply_out_of_view_termination_exp5a(
+                    self.all_trajs[track_id], frame_info, source="matched_bev"
+                )
+                if not exp5a_deleted:
+                    self._update_full_vehicle_reference_exp5a(
+                        self.all_trajs[track_id], frame_info, source="matched_bev"
+                    )
             else:
                 unmatched_trajs[track_id] = self.all_trajs[track_id]
                 if not self.cfg["IS_RV_MATCHING"]:
@@ -335,6 +665,14 @@ class Base3DTracker:
                     self.all_trajs[track_id].update(
                         det_bbox, float(cost_matrix_inbev[indexes])
                     )
+                    # 实验五A v6：RV 二次匹配后也先检查真实出界，再更新参考面积。
+                    exp5a_deleted = self._apply_out_of_view_termination_exp5a(
+                        self.all_trajs[track_id], frame_info, source="matched_rv"
+                    )
+                    if not exp5a_deleted:
+                        self._update_full_vehicle_reference_exp5a(
+                            self.all_trajs[track_id], frame_info, source="matched_rv"
+                        )
                 else:
                     self.unmatch_update_with_hsm(track_id, frame_info.frame_id)
 
@@ -349,6 +687,10 @@ class Base3DTracker:
                 track_id=self.track_id_counter,
                 init_bbox=init_bboxes[i],
                 cfg=self.cfg,
+            )
+            # 实验五A v6：新生轨迹如果完整可见，先记录完整车辆面积。
+            self._update_full_vehicle_reference_exp5a(
+                self.all_trajs[self.track_id_counter], frame_info, source="new_track"
             )
             self.track_id_counter += 1
 
@@ -394,6 +736,7 @@ class Base3DTracker:
 
         return output_trajs
     def post_processing(self):
+        self._print_exp5a_summary()
         trajs = {}
         for track_id in self.all_dead_trajs.keys():
             traj = self.all_dead_trajs[track_id]
