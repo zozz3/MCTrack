@@ -42,8 +42,8 @@ MATCHING:
 # ----------------threshold------------
 THRESHOLD:
   #如果轨迹分数低于或等于这个阈值，就会被删掉。
-  GLOBAL_TRACK_SCORE: 1.4
-  NMS_THRE: {0: 0.08} 
+  GLOBAL_TRACK_SCORE: 0.56
+  NMS_THRE: {0: 0.2}
   INPUT_SCORE: 
     ONLINE: {0: 0.375}
     OFFLINE: {0: 0.3775}
@@ -69,7 +69,7 @@ THRESHOLD:
     #判断轨迹是否足够可靠检测框本身分数高
     CONFIRMED_DET_SCORE: {0: 0.7}
     #不输出纯预测轨迹的框
-    IS_FILTER_PREDICT_BOX: {0: 0}
+    IS_FILTER_PREDICT_BOX: {0: 0.1}
     #匹配质量还可以
     CONFIRMED_MATCHED_SCORE: {0: 0.3} 
 
@@ -274,7 +274,7 @@ FULL_IMAGE_BBOX_SOFT_IGNORE:
   MIN_WIDTH_RATIO: 0.95
   MIN_HEIGHT_RATIO: 0.90
   MIN_AREA_RATIO: 0.85
-  DEBUG: True
+  DEBUG: False
   PRINT_SUMMARY: True
 #新生轨迹遮挡抑制模块
 NEWBORN_OCCLUSION_SUPPRESS:
@@ -285,5 +285,5 @@ NEWBORN_OCCLUSION_SUPPRESS:
   SCORE_TOLERANCE: 0.5
   #当前 detection 的 2D bbox 面积太小，就不参与这个遮挡抑制判断。
   MIN_AREA: 80
-  DEBUG: True
+  DEBUG: False
   PRINT_SUMMARY: True
