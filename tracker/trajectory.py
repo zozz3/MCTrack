@@ -12,16 +12,33 @@ from scipy.optimize import curve_fit
 
 np.set_printoptions(formatter={"float": "{:0.4f}".format})
 
+
 def linear_func(x, a, b):
     return a * x + b
 
+
+def _cfg_by_cls(value, cls_id, default):
+    """
+    兼容 {0: value} / {"0": value} / 单值 三种配置形式。
+    """
+    if isinstance(value, dict):
+        if cls_id in value:
+            return value[cls_id]
+        if str(cls_id) in value:
+            return value[str(cls_id)]
+        return default
+    if value is None:
+        return default
+    return value
+
+
 class Trajectory:
     def __init__(
-        self,
-        track_id,
-        init_bbox=None,
-        first_bbox=True,
-        cfg=None,
+            self,
+            track_id,
+            init_bbox=None,
+            first_bbox=True,
+            cfg=None,
     ):
         self.track_id = track_id
         self.category_num = cfg["CATEGORY_MAP_TO_NUMBER"][init_bbox.category]
@@ -42,7 +59,7 @@ class Trajectory:
         ctra_init_pose = np.array(
             init_bbox.global_xyz_lwh_yaw[:2] + [0.1, 0.1, 0.1, 0.1]
         )
-        
+
         cv_init_yaw = np.array([init_bbox.global_yaw, 0.0])
         cv_init_size = np.array([init_bbox.lwh[0], init_bbox.lwh[1], 0.0, 0.0])
 
@@ -72,7 +89,7 @@ class Trajectory:
         self._is_filter_predict_box = cfg["THRESHOLD"]["TRAJECTORY_THRE"][
             "IS_FILTER_PREDICT_BOX"
         ][self.category_num]
-        
+
         self.status_flag = 1  # 0:initialization / 1: confirmed / 2: obscured / 4: dead
         # we have tried to set the status_flag to 0, but it seems that it is not necessary
 
@@ -85,7 +102,7 @@ class Trajectory:
             R=np.diag(cfg["KALMAN_FILTER_POSE"]["CV"]["NOISE"][self.category_num]["R"]),
             init_x=cv_init_pose,
         )
-        self.ca_filter_pose  = EKF_CA(
+        self.ca_filter_pose = EKF_CA(
             dt=1 / self.frame_rate,
             n=cfg["KALMAN_FILTER_POSE"]["CA"]["N"],
             m=cfg["KALMAN_FILTER_POSE"]["CA"]["M"],
@@ -94,7 +111,7 @@ class Trajectory:
             R=np.diag(cfg["KALMAN_FILTER_POSE"]["CA"]["NOISE"][self.category_num]["R"]),
             init_x=ca_init_pose,
         )
-        self.ctra_filter_pose  = EKF_CTRA(
+        self.ctra_filter_pose = EKF_CTRA(
             dt=1 / self.frame_rate,
             n=cfg["KALMAN_FILTER_POSE"]["CTRA"]["N"],
             m=cfg["KALMAN_FILTER_POSE"]["CTRA"]["M"],
@@ -121,15 +138,15 @@ class Trajectory:
             R=np.diag(cfg["KALMAN_FILTER_SIZE"]["CV"]["NOISE"][self.category_num]["R"]),
             init_x=cv_init_size,
         )
-        
+
         if cfg["KALMAN_FILTER_POSE"]["MOTION_MODE"][self.category_num] == "CV":
             self.kalman_filter_pose = self.cv_filter_pose
         elif cfg["KALMAN_FILTER_POSE"]["MOTION_MODE"][self.category_num] == "CA":
-            self.kalman_filter_pose = self.ca_filter_pose 
+            self.kalman_filter_pose = self.ca_filter_pose
         elif cfg["KALMAN_FILTER_POSE"]["MOTION_MODE"][self.category_num] == "CTRA":
-            self.kalman_filter_pose = self.ctra_filter_pose 
-        
-        # if cfg["IS_RV_MATCHING"]:
+            self.kalman_filter_pose = self.ctra_filter_pose
+
+            # if cfg["IS_RV_MATCHING"]:
         #     xywh = init_bbox.transform_bbox_tlbr2xywh()
         #     init_rvbox = np.array(xywh.tolist() + [0.0, 0.0, 0.0, 0.0])
         #     self.kalman_filter_rvbox = EKF_RVBOX(
@@ -224,16 +241,127 @@ class Trajectory:
             return max(disps) <= static_disp_thre
 
         return float(np.mean(disps)) <= static_disp_thre
+
+    def _get_bbox_bev_distance_for_global_score(self, bbox):
+        """
+        获取用于距离感知 GLOBAL_TRACK_SCORE 的 BEV 距离。
+        优先使用融合后的真实位置，其次使用原始位置。
+        """
+        if bbox is None:
+            return None
+
+        for name in [
+            "global_xyz_lwh_yaw_fusion",
+            "global_xyz_lwh_yaw",
+            "global_xyz",
+            "xyz",
+        ]:
+            if not hasattr(bbox, name):
+                continue
+
+            value = getattr(bbox, name)
+            if value is None:
+                continue
+
+            try:
+                arr = np.asarray(value, dtype=float).reshape(-1)
+            except Exception:
+                continue
+
+            if arr.shape[0] >= 2 and np.all(np.isfinite(arr[:2])):
+                return float(np.linalg.norm(arr[:2]))
+
+        return None
+
+    def _get_reliable_distance_for_global_score(self):
+        """
+        获取一条轨迹的可靠距离。
+
+        默认使用最后一个真实检测框 LAST_REAL_BBOX，避免使用 Kalman fake bbox 的漂移位置。
+        也支持 MEAN_REAL_BBOX，后续需要时可以在配置中切换。
+        """
+        threshold_cfg = self.cfg.get("THRESHOLD", {})
+        dist_score_cfg = threshold_cfg.get("GLOBAL_TRACK_SCORE_BY_DIST", {})
+        distance_source = str(dist_score_cfg.get("DISTANCE_SOURCE", "LAST_REAL_BBOX")).upper()
+
+        real_distances = []
+        for bbox in self.bboxes:
+            if getattr(bbox, "is_fake", False):
+                continue
+            dist = self._get_bbox_bev_distance_for_global_score(bbox)
+            if dist is not None:
+                real_distances.append(dist)
+
+        if len(real_distances) == 0:
+            return 0.0
+
+        if distance_source == "MEAN_REAL_BBOX":
+            return float(np.mean(real_distances))
+
+        # 默认：最后一个真实检测框距离。
+        return float(real_distances[-1])
+
+    def _get_distance_bucket_for_global_score(self, dist):
+        """
+        根据统一 DISTANCE_POLICY 划分 near / mid / far。
+        """
+        dist_policy = self.cfg.get("DISTANCE_POLICY", {})
+        near_dist = float(_cfg_by_cls(dist_policy.get("NEAR_DIST", {0: 30.0}), self.category_num, 30.0))
+        mid_dist = float(_cfg_by_cls(dist_policy.get("MID_DIST", {0: 50.0}), self.category_num, 50.0))
+
+        if dist < near_dist:
+            return "NEAR", near_dist, mid_dist
+        if dist < mid_dist:
+            return "MID", near_dist, mid_dist
+        return "FAR", near_dist, mid_dist
+
+    def _get_global_track_score_threshold(self):
+        """
+        实验五F：距离感知 GLOBAL_TRACK_SCORE。
+
+        原始 MCTrack 只使用 THRESHOLD.GLOBAL_TRACK_SCORE 一个全局阈值。
+        这里在开启 GLOBAL_TRACK_SCORE_BY_DIST 后，根据轨迹可靠距离选择不同阈值：
+        - 近距离：阈值更高，抑制近距离低质量假轨迹；
+        - 中距离：中等阈值；
+        - 远距离：阈值更低，避免远距离真实小目标被后处理误删。
+        """
+        threshold_cfg = self.cfg.get("THRESHOLD", {})
+        base_score = float(threshold_cfg.get("GLOBAL_TRACK_SCORE", 1.4))
+
+        dist_score_cfg = threshold_cfg.get("GLOBAL_TRACK_SCORE_BY_DIST", {})
+        if not bool(dist_score_cfg.get("ENABLE", False)):
+            return base_score, None, None
+
+        dist = self._get_reliable_distance_for_global_score()
+        bucket, near_dist, mid_dist = self._get_distance_bucket_for_global_score(dist)
+
+        if bucket == "NEAR":
+            score_thre = float(_cfg_by_cls(dist_score_cfg.get("NEAR", {0: base_score}), self.category_num, base_score))
+        elif bucket == "MID":
+            score_thre = float(_cfg_by_cls(dist_score_cfg.get("MID", {0: base_score}), self.category_num, base_score))
+        else:
+            score_thre = float(_cfg_by_cls(dist_score_cfg.get("FAR", {0: base_score}), self.category_num, base_score))
+
+        info = {
+            "dist": float(dist),
+            "bucket": bucket,
+            "near_dist": float(near_dist),
+            "mid_dist": float(mid_dist),
+            "threshold": float(score_thre),
+            "base_threshold": float(base_score),
+        }
+        return score_thre, bucket, info
+
     def get_measure(self, bbox: BBox, filter_flag="pose"):
         global_xyz = bbox.global_xyz
         global_yaw = bbox.global_yaw
         global_velocity = bbox.global_velocity
         lwh = bbox.lwh
-        
+
         if filter_flag == "pose":
             measure = np.array([global_xyz[0], global_xyz[1], global_velocity[0], global_velocity[1]])
         elif filter_flag == "yaw":
-            vel_yaw = np.arctan2(global_velocity[1], global_velocity[0]+1e-5)
+            vel_yaw = np.arctan2(global_velocity[1], global_velocity[0] + 1e-5)
             vel_yaw_norm = norm_radian(vel_yaw)
             pose_yaw_norm = norm_radian(global_yaw)
             measure = np.array([pose_yaw_norm, vel_yaw_norm])
@@ -245,7 +373,7 @@ class Trajectory:
             raise ValueError(f"Unexpected filter_flag value: {filter_flag}")
 
         return measure
-    
+
     def predict(self):
         predict_state = self.kalman_filter_pose.predict()
         predict_yaw = self.kalman_filter_yaw.predict()
@@ -253,7 +381,7 @@ class Trajectory:
         # if self.cfg["IS_RV_MATCHING"]:
         #     predict_rvbox = self.kalman_filter_rvbox.predict()
         #     self.bboxes[-1].x1y1x2y2_predict = predict_rvbox[:4]
-        
+
         global_xyz_lwh_yaw_fusion = self.bboxes[-1].global_xyz_lwh_yaw_fusion
 
         predict_xyz = predict_state[:2].tolist() + [global_xyz_lwh_yaw_fusion[2]]
@@ -262,7 +390,7 @@ class Trajectory:
         self.bboxes[-1].global_xyz_lwh_yaw_predict = predict_xyz + predict_lwh + [global_xyz_lwh_yaw_fusion[6]]
 
         self.bboxes[-1].global_yaw_fusion = predict_yaw[0]
-        self.bboxes[-1].lwh_fusion = predict_lwh   
+        self.bboxes[-1].lwh_fusion = predict_lwh
 
     def update(self, bbox: BBox, matched_score):
         bbox.track_id = self.track_id
@@ -276,33 +404,33 @@ class Trajectory:
             self.bboxes.pop(0)
 
         self.matched_scores.append(matched_score)
-        
+
         global_velocity_diff = self.cal_diff_velocity()
         self.bboxes[-1].global_velocity_diff = global_velocity_diff
         global_velocity_curve = self.cal_curve_velocity()
         self.bboxes[-1].global_velocity_curve = global_velocity_curve
-        
+
         # ======== pose filter ==========
-        pose_mesure = self.get_measure(bbox, filter_flag="pose")   
+        pose_mesure = self.get_measure(bbox, filter_flag="pose")
         if self.kalman_filter_pose.m == 2:
             pose_mesure = pose_mesure[:2]
         update_state = self.kalman_filter_pose.update(pose_mesure)
         self.bboxes[-1].global_velocity_fusion = update_state[2:4].tolist()
-        
+
         # ======== yaw filter ==========
         yaw_mesure = self.get_measure(bbox, filter_flag="yaw")
         update_yaw = self.kalman_filter_yaw.update(yaw_mesure)
         self.bboxes[-1].global_yaw_fusion = update_yaw[0]
-        
+
         # ======== size filter ==========
-        size_mesure = self.get_measure(bbox, filter_flag="size")  
+        size_mesure = self.get_measure(bbox, filter_flag="size")
         update_size = self.kalman_filter_size.update(size_mesure)
         update_lwh = update_size[:2].tolist() + [self.bboxes[-1].lwh[2]]
         self.bboxes[-1].lwh_fusion = update_lwh
 
         # ======== rv box filter ==========
         # if self.cfg["IS_RV_MATCHING"]:
-        #     rvbox_mesure = self.get_measure(bbox, filter_flag="rvbox")  
+        #     rvbox_mesure = self.get_measure(bbox, filter_flag="rvbox")
         #     update_rvbox = self.kalman_filter_rvbox.update(rvbox_mesure)
         #     self.bboxes[-1].x1y1x2y2_fusion = bbox.transform_bbox_xywh2tlbr(update_rvbox[:4])
 
@@ -311,11 +439,11 @@ class Trajectory:
             update_state[:2], self.bboxes[-1].global_xyz_lwh_yaw[2:]
         )
 
-        self.bboxes[-1].matched_score = matched_score 
+        self.bboxes[-1].matched_score = matched_score
 
         if self.track_length > self._confirmed_track_length or (
-            matched_score > self._confirmed_match_score
-            and self.bboxes[-1].det_score > self._confirmed_det_score
+                matched_score > self._confirmed_match_score
+                and self.bboxes[-1].det_score > self._confirmed_det_score
         ):
             self.status_flag = 1
 
@@ -340,17 +468,17 @@ class Trajectory:
         fake_bbox.det_score = 0
         fake_bbox.is_fake = True
         fake_bbox.frame_id = frame_id
-        
+
         fake_xyz = fake_update_state[:2].tolist() + [fake_bbox.global_xyz_lwh_yaw[2]]
         fake_lwh = predict_size[:2].tolist() + [fake_bbox.global_xyz_lwh_yaw[5]]
         fake_bbox.global_xyz_lwh_yaw = fake_xyz + fake_lwh + [self.bboxes[-1].global_xyz_lwh_yaw[-1]]
         fake_bbox.global_xyz_lwh_yaw_fusion = fake_xyz + fake_lwh + [self.bboxes[-1].global_xyz_lwh_yaw[-1]]
-        
+
         self.bboxes.append(fake_bbox)
         self.matched_scores.append(0)
         self.bboxes[-1].matched_score = 0
         self.bboxes[-1].unmatch_length = self.unmatch_length
-        
+
         global_velocity_diff = self.cal_diff_velocity()
         self.bboxes[-1].global_velocity_diff = global_velocity_diff
         global_velocity_curve = self.cal_curve_velocity()
@@ -359,7 +487,7 @@ class Trajectory:
         if len(self.bboxes) > self._cache_bbox_len:
             self.bboxes.pop(0)
 
-        if self.status_flag == 0 and self.track_length > self._confirmed_track_length: 
+        if self.status_flag == 0 and self.track_length > self._confirmed_track_length:
             self.status_flag = 4
 
         if self.status_flag == 1 and self.unmatch_length > self._max_unmatch_len:
@@ -376,7 +504,7 @@ class Trajectory:
         if y <= 0 or y >= 1:
             raise ValueError("Input must be in the range (0, 1).")
         return np.log(y / (1 - y))
-    
+
     def filtering(self):
         '''
         Refer: https://github.com/hailanyi/3D-Multi-Object-Tracker/blob/master/tracker/trajectory.py
@@ -386,7 +514,7 @@ class Trajectory:
         score_sum = 0
         if_has_unmatched = 0
         unmatch_bbox_sum = 0
-        start_xyz_lwh_yaw = None 
+        start_xyz_lwh_yaw = None
         start_frame = 0
 
         last_xyz_lwh_yaw_fusion = None
@@ -395,8 +523,8 @@ class Trajectory:
             bbox.det_score = self.logit(bbox.det_score)
             if bbox.det_score > -10000:
                 detected_num += 1
-                score_sum += bbox.det_score  
-            if self.first_updated_frame <= frame_id <= self.last_updated_frame and bbox.is_fake and self.is_output: 
+                score_sum += bbox.det_score
+            if self.first_updated_frame <= frame_id <= self.last_updated_frame and bbox.is_fake and self.is_output:
                 bbox.is_interpolation = True
                 if if_has_unmatched == 0:
                     start_xyz_lwh_yaw = last_xyz_lwh_yaw_fusion
@@ -422,11 +550,53 @@ class Trajectory:
 
                 if_has_unmatched = 0
             last_xyz_lwh_yaw_fusion = bbox.global_xyz_lwh_yaw_fusion
-                
+
         score = score_sum / detected_num
+
+        # ------------------------------------------------------------
+        # 实验五F：距离感知 GLOBAL_TRACK_SCORE
+        # ------------------------------------------------------------
+        # 原始 MCTrack 在轨迹后处理中使用统一 GLOBAL_TRACK_SCORE，
+        # 容易把远距离真实小目标轨迹误删。
+        # 这里根据轨迹可靠距离选择 near / mid / far 阈值。
+        # 注意：如果该轨迹低于距离感知阈值，直接把整条轨迹分数置为 -10000，
+        # 这样后续原始结果保存阶段即使仍使用 GLOBAL_TRACK_SCORE，也会过滤掉它。
+        # ------------------------------------------------------------
+        global_score_thre, dist_bucket, dist_info = self._get_global_track_score_threshold()
+        pass_global_track_score = bool(score > global_score_thre)
+
+        threshold_cfg = self.cfg.get("THRESHOLD", {})
+        dist_score_cfg = threshold_cfg.get("GLOBAL_TRACK_SCORE_BY_DIST", {})
+        dist_score_enabled = bool(dist_score_cfg.get("ENABLE", False))
+
+        if dist_score_enabled and bool(dist_score_cfg.get("DEBUG", False)):
+            print(
+                "[GLOBAL_TRACK_SCORE_BY_DIST]",
+                "track_id=", self.track_id,
+                "len=", len(self.bboxes),
+                "raw_score=", round(float(score), 4),
+                "threshold=", round(float(global_score_thre), 4),
+                "pass=", pass_global_track_score,
+                "bucket=", dist_bucket,
+                "dist=", round(float(dist_info.get("dist", 0.0)), 2) if isinstance(dist_info, dict) else None,
+            )
+
+        final_score = float(score)
+        if dist_score_enabled and not pass_global_track_score:
+            final_score = -10000.0
+
         for bbox in self.bboxes:
-            bbox.det_score = score
-            
+            bbox.det_score = final_score
+            bbox.global_track_score_raw = float(score)
+            bbox.global_track_score_threshold = float(global_score_thre)
+            bbox.global_track_score_pass = bool(pass_global_track_score)
+            if isinstance(dist_info, dict):
+                bbox.global_track_score_distance = float(dist_info.get("dist", 0.0))
+                bbox.global_track_score_bucket = dist_info.get("bucket", None)
+            else:
+                bbox.global_track_score_distance = None
+                bbox.global_track_score_bucket = None
+
     def cal_diff_velocity(self):
         if len(self.bboxes) > 1:
             prev_bbox = self.bboxes[-2]
@@ -440,7 +610,7 @@ class Trajectory:
         else:
             global_velocity_diff = [0.0, 0.0]
         return global_velocity_diff
-    
+
     def cal_curve_velocity(self):
         if len(self.bboxes) > 2:
             x_vals = [bb.frame_id for bb in self.bboxes[-3:]]
@@ -455,5 +625,5 @@ class Trajectory:
                 global_velocity_curve = [0.0, 0.0]
         else:
             global_velocity_curve = [0.0, 0.0]
-        
+
         return global_velocity_curve

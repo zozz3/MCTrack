@@ -23,19 +23,30 @@ CATEGORY_MAP_TO_NUMBER : {
     "car": 0,
 }
 
+# ---------------- distance policy ----------------
+# 统一管理近 / 中 / 远距离划分，后续所有和远近相关的模块都尽量复用这组阈值。
+# near: dist < 30m
+# mid : 30m <= dist < 50m
+# far : dist >= 50m
+DISTANCE_POLICY:
+  ENABLE: True
+  NEAR_DIST: {0: 30.0}
+  MID_DIST: {0: 65.0}
+
+
 MATCHING:
   BEV:
     # Predict, BackPredict, Fusion
-    COST_STATE: {0: "Predict"} 
+    COST_STATE: {0: "Predict"}
     # iou_3d, giou_3d, dist_3d, ro_gdiou_3d
-    COST_MODE: {0: "RO_GDIOU_3D"} 
+    COST_MODE: {0: "RO_GDIOU_3D"}
     MATCHING_MODE: Hungarian  # Hungarian, Greedy
   #图像平面匹配再把 BEV 没匹配上的轨迹和检测框拿去做 RV 匹配。RV 匹配成功后，代码还会额外检查 yaw 差和空间距离
   RV:
     # Predict, BackPredict, Fusion
-    COST_STATE: {0: "Predict"} 
+    COST_STATE: {0: "Predict"}
     # iou_2d, iou_2d, diou_2d, sdiou_2d
-    COST_MODE: {0: "SDIOU_2D"} 
+    COST_MODE: {0: "SDIOU_2D"}
     MATCHING_MODE : Greedy  # Hungarian, Greedy
 
 
@@ -43,18 +54,28 @@ MATCHING:
 THRESHOLD:
   #如果轨迹分数低于或等于这个阈值，就会被删掉。
   GLOBAL_TRACK_SCORE: 0.56
-  NMS_THRE: {0: 0.2}
-  INPUT_SCORE: 
+  # 距离感知的轨迹级过滤阈值。
+  # 原始 MCTrack 只有一个 GLOBAL_TRACK_SCORE，远距离真实小目标容易被误删。
+  # 这里近距离更严格，中距离适中，远距离沿用你当前测试出的较低阈值。
+  GLOBAL_TRACK_SCORE_BY_DIST:
+    ENABLE: True
+    DISTANCE_SOURCE: "LAST_REAL_BBOX"  # LAST_REAL_BBOX / MEAN_REAL_BBOX
+    NEAR: {0: 1.4}
+    MID: {0: 1.2}
+    FAR: {0: 0.56}
+    DEBUG: False
+  NMS_THRE: {0: 0.08}
+  INPUT_SCORE:
     ONLINE: {0: 0.375}
     OFFLINE: {0: 0.3775}
   COST_STATE_PREDICT_RATION: {0: 0.5}
   BEV:
     #匹配阈值
-    COST_THRE: {0: 1.4} 
+    COST_THRE: {0: 1.4}
     # Notes: You need to ensure that w1 + w2 = 2 , otherwise you will need to readjust the threshold of RO_GDIOU.
     WEIGHT_RO_GDIOU: {0: {"w1": 1.0, "w2": 1.0}}
   RV:
-    COST_THRE: {0: -0.3} 
+    COST_THRE: {0: -0.3}
 
   TRAJECTORY_THRE:
     #缓存历史框
@@ -71,7 +92,7 @@ THRESHOLD:
     #不输出纯预测轨迹的框
     IS_FILTER_PREDICT_BOX: {0: 0.1}
     #匹配质量还可以
-    CONFIRMED_MATCHED_SCORE: {0: 0.3} 
+    CONFIRMED_MATCHED_SCORE: {0: 0.3}
 
 #位置运动模型
 KALMAN_FILTER_POSE:
@@ -141,42 +162,32 @@ KALMAN_FILTER_RVBOX:
 # ---------------- group motion switch for exp1 ----------------
 HSM_LTM:
   ENABLE: True
-
   # 回看丢失前几帧
   HISTORY_WINDOW: {0: 3}
-
   # 第几帧丢失开始启用审查，1 表示第一次 unmatched 后就启用
   START_UNMATCH_LENGTH: {0: 1}
-
   # 新增：运动状态感知分支
   MOTION_STATE:
     ENABLE: True
-
     # 是否严格区分静止目标和运动目标
     # True 表示只有丢失前连续近零位移的目标才算静止
     # 低速目标仍然归为运动目标
     STRICT_STATIC: True
-
     # 静止判断阈值
     # 这里对应你之前分析过的 zero_eps=0.02
     # 表示相邻帧中心点 BEV 位移接近 0 才认为是静止候选
     STATIC_DISP_THRE: {0: 0.02}
-
     # 是否要求 HISTORY_WINDOW 内每一段位移都小于阈值
     # 建议 True，比平均位移更严格
     REQUIRE_ALL_STATIC: True
-
     # 静止目标的预测方式
     # KALMAN_ONLY 表示静止目标不使用群体运动
     STATIC_PRED_MODE: "KALMAN_ONLY"
-
     # 运动目标的预测方式
     # ORIGINAL_HSM_LTM 表示完全沿用你之前实验一的 HSM_LTM 逻辑
     MOVING_PRED_MODE: "ORIGINAL_HSM_LTM"
-
     # 打印调试信息，方便看有多少轨迹进入静止分支/运动分支
     DEBUG: False
-
   # 参考车辆筛选条件
   # 注意：这里是给“运动目标使用 HSM_LTM 时”筛选参考车辆用的
   # 不用于判断丢失轨迹自己是不是静止
@@ -187,7 +198,6 @@ HSM_LTM:
     MAX_DISTANCE: {0: 25.0}
     MAX_DIR_DIFF_DEG: {0: 35.0}
     MAX_SPEED_REL_DIFF: {0: 0.6}
-
   # 参考车辆选择方式
   SELECTION:
     MODE: "TOPK_WEIGHTED_RANDOM"   # TOPK / RANDOM / TOPK_WEIGHTED_RANDOM
@@ -195,7 +205,6 @@ HSM_LTM:
     SAMPLE_NUM: {0: 3}
     RANDOM_SEED: 2026
     MIN_REF_NUM: {0: 2}
-
   # 相似度权重
   WEIGHT:
     DIR: {0: 0.4}
@@ -217,20 +226,6 @@ HSM_LTM:
     ONLY_BLEND_WHEN_POS_NORMAL: True
 
     DEBUG: False
-  # 一致性判断阈值，第一版要保守，不要删太狠
-CONSISTENCY:
-  ENABLE: False
-  DEBUG: False
-
-  DIR_THRE_DEG: {0: 45.0}
-  SPEED_REL_THRE: {0: 0.8}
-
-  POS_RES_THRE_NEAR: {0: 6.0}
-  POS_RES_THRE_MID: {0: 8.0}
-  POS_RES_THRE_FAR: {0: 12.0}
-
-  NEAR_DIST: {0: 30.0}
-  MID_DIST: {0: 50.0}
 
 # ---------------- group motion switch for exp2 ----------------
 GROUP_MOTION:
@@ -248,6 +243,13 @@ GROUP_MOTION:
 
 OUTPUT_FILTER:
   ENABLE: True
+  # 与 DISTANCE_POLICY 保持一致；当前代码如果还没读取这个字段，则先作为实验配置记录。
+  USE_DISTANCE_POLICY: True
+  MIN_OUTPUT_SCORE_BY_DIST:
+    ENABLE: True
+    NEAR: {0: 0.45}
+    MID: {0: 0.40}
+    FAR: {0: 0.30}
   MIN_OUTPUT_TRACK_LENGTH: { 0: 3}
   MIN_OUTPUT_SCORE: { 0: 0.40 }
   FAR_DIST: { 0: 50.0 }
@@ -260,11 +262,10 @@ EXP5A_OUT_OF_VIEW:
   ENABLE: True
   PRINT_SUMMARY: True
   DEBUG: False
-
   IMAGE_WIDTH: 1242
   IMAGE_HEIGHT: 375
-  REMAIN_RATIO_THRE: {0: 0.435}
-  MIN_REF_AREA: {0: 80.0}
+  REMAIN_RATIO_THRE: {0: 0.465}
+  MIN_REF_AREA: {0: 130.0}
 
   REQUIRE_BOUNDARY_TOUCH: True
   BOUNDARY_MARGIN: 0
