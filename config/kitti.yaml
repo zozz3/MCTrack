@@ -67,7 +67,7 @@ THRESHOLD:
   COST_STATE_PREDICT_RATION: {0: 0.5}
   BEV:
     #匹配阈值
-    COST_THRE: {0: 1.4}
+    COST_THRE: {0: 1.26}
     # Notes: You need to ensure that w1 + w2 = 2 , otherwise you will need to readjust the threshold of RO_GDIOU.
     WEIGHT_RO_GDIOU: {0: {"w1": 1.0, "w2": 1.0}}
   RV:
