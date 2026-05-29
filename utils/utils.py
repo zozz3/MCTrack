@@ -118,21 +118,84 @@ def mask_tras_dets(cls_num, tra_labels, det_labels):
     tmp_labels[np.where(same_mask)] = -1
     return tmp_labels[None, :, :].repeat(cls_num, axis=0) == cls_mask
 
+def _cfg_by_cls(value, cls_id, default):
+    if isinstance(value, dict):
+        if cls_id in value:
+            return value[cls_id]
+        if str(cls_id) in value:
+            return value[str(cls_id)]
+        return default
+    if value is None:
+        return default
+    return value
 
-def blend_nms(box_infos, metrics, thre):
+
+def _get_box_bev_dist_from_np_det(np_det):
+    """
+    np_det 格式：
+    [x, y, z, w, l, h, vx, vy, qw, qx, qy, qz, det_score, class_label]
+
+    用 x, y 计算 BEV 距离。
+    """
+    if np_det is None or len(np_det) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.asarray(np_det[:2], dtype=float)))
+
+
+def _get_nms_thre_by_dist(np_det, cfg, default_thre):
+    """
+    根据当前 box 的 BEV 距离选择 NMS 阈值。
+    如果没有开启 NMS_THRE_BY_DIST，则退回原始 default_thre。
+    """
+    if cfg is None:
+        return float(default_thre)
+
+    threshold_cfg = cfg.get("THRESHOLD", {})
+    nms_dist_cfg = threshold_cfg.get("NMS_THRE_BY_DIST", {})
+
+    if not bool(nms_dist_cfg.get("ENABLE", False)):
+        return float(default_thre)
+
+    cls_id = int(np_det[-1])
+
+    dist_policy = cfg.get("DISTANCE_POLICY", {})
+    near_dist = float(_cfg_by_cls(dist_policy.get("NEAR_DIST", {0: 30.0}), cls_id, 30.0))
+    mid_dist = float(_cfg_by_cls(dist_policy.get("MID_DIST", {0: 65.0}), cls_id, 65.0))
+
+    dist = _get_box_bev_dist_from_np_det(np_det)
+
+    if dist < near_dist:
+        bucket = "NEAR"
+    elif dist < mid_dist:
+        bucket = "MID"
+    else:
+        bucket = "FAR"
+
+    selected = float(_cfg_by_cls(nms_dist_cfg.get(bucket, {cls_id: default_thre}), cls_id, default_thre))
+
+    if bool(nms_dist_cfg.get("DEBUG", False)):
+        print(
+            "[NMS_THRE_BY_DIST]",
+            "cls=", cls_id,
+            "dist=", round(dist, 2),
+            "bucket=", bucket,
+            "thre=", selected,
+            "default=", default_thre,
+        )
+
+    return selected
+def blend_nms(box_infos, metrics, thre, cfg=None):
     """
     Refer: https://github.com/lixiaoyu2000/Poly-MOT/blob/main/pre_processing/nusc_nms.py
-    Info: This function performs Non-Maximum Suppression (NMS) using different similarity metrics to filter bounding boxes.
-    Parameters:
-        input:
-            box_infos:
-                - np_dets: [x, y, z, w, l, h, vx, vy, qw, qx, qy, qz, det_score, class_label]
-                - np_dets_bottom_corners: (n, 4, 2), bottom corners of each box.
-            metrics: A string specifying the similarity metric (e.g., iou_bev, iou_3d, giou_bev, etc.).
-            thre: Threshold for the NMS operation.
 
-        output:
-            keep: List of indices for boxes that are kept after NMS.
+    距离感知版本：
+    - 原始逻辑：同一类别使用固定 NMS_THRE
+    - 新逻辑：如果 cfg.THRESHOLD.NMS_THRE_BY_DIST.ENABLE=True，
+      则根据 box 的 BEV 距离使用 NEAR/MID/FAR 阈值。
+
+    注意：
+    pairwise NMS 时使用 max(thre_current, thre_candidate)，
+    这样可以保护远距离目标，避免远距离真实小目标被过强 NMS 压掉。
     """
     assert metrics in [
         "iou_bev",
@@ -141,25 +204,69 @@ def blend_nms(box_infos, metrics, thre):
         "giou_3d",
         "d_eucl",
     ], "unsupported NMS metrics"
+
     assert (
         "np_dets" in box_infos and "np_dets_bottom_corners" in box_infos
     ), "must contain specified keys"
 
     infos, corners = box_infos["np_dets"], box_infos["np_dets_bottom_corners"]
+
     sort_idxs, keep = np.argsort(-infos[:, -2]), []
+
     while sort_idxs.size > 0:
         i = sort_idxs[0]
         keep.append(i)
+
         if sort_idxs.size == 1:
             break
+
         current_class = int(infos[i, -1])
-        current_thre = thre[current_class]
+        default_current_thre = float(thre[current_class])
+
+        current_thre = _get_nms_thre_by_dist(
+            np_det=infos[i],
+            cfg=cfg,
+            default_thre=default_current_thre,
+        )
+
+        remain_idxs = sort_idxs[1:]
+
         left, first = [
             {"np_dets_bottom_corners": corners[idx], "np_dets": infos[idx]}
-            for idx in [sort_idxs[1:], i]
+            for idx in [remain_idxs, i]
         ]
+
         distances = iou_bev(first, left)[0]
-        sort_idxs = sort_idxs[1:][distances <= current_thre]
+
+        # ------------------------------------------------------------
+        # 距离感知 pairwise NMS threshold
+        # ------------------------------------------------------------
+        # 原始代码：
+        #   sort_idxs = sort_idxs[1:][distances <= current_thre]
+        #
+        # 新逻辑：
+        #   当前框和候选框分别取自己的距离感知阈值，
+        #   pair 阈值使用 max(current_thre, candidate_thre)。
+        #   这样 near-far 或 mid-far 组合不会因为近距离阈值过严而误删远距离目标。
+        # ------------------------------------------------------------
+        pair_thres = []
+
+        for idx in remain_idxs:
+            cand_class = int(infos[idx, -1])
+            default_cand_thre = float(thre[cand_class])
+
+            cand_thre = _get_nms_thre_by_dist(
+                np_det=infos[idx],
+                cfg=cfg,
+                default_thre=default_cand_thre,
+            )
+
+            pair_thres.append(max(float(current_thre), float(cand_thre)))
+
+        pair_thres = np.asarray(pair_thres, dtype=float)
+
+        sort_idxs = remain_idxs[distances <= pair_thres]
+
     return keep
 
 

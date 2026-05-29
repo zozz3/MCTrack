@@ -32,8 +32,6 @@ DISTANCE_POLICY:
   ENABLE: True
   NEAR_DIST: {0: 30.0}
   MID_DIST: {0: 65.0}
-
-
 MATCHING:
   BEV:
     # Predict, BackPredict, Fusion
@@ -48,8 +46,6 @@ MATCHING:
     # iou_2d, iou_2d, diou_2d, sdiou_2d
     COST_MODE: {0: "SDIOU_2D"}
     MATCHING_MODE : Greedy  # Hungarian, Greedy
-
-
 # ----------------threshold------------
 THRESHOLD:
   #如果轨迹分数低于或等于这个阈值，就会被删掉。
@@ -207,9 +203,9 @@ HSM_LTM:
     MIN_REF_NUM: {0: 2}
   # 相似度权重
   WEIGHT:
-    DIR: {0: 0.4}
-    SPEED: {0: 0.4}
-    DIST: {0: 0.1}
+    DIR: {0: 0.3}
+    SPEED: {0: 0.3}
+    DIST: {0: 0.3}
     SCORE: {0: 0.1}
 
   PREDICTION:
@@ -235,40 +231,69 @@ GROUP_MOTION:
   # 速度太小的轨迹不参与方向判断，单位近似 m/s
   MIN_SPEED: 0.5
   # 群体主方向允许的角度离散度
-  DIR_STD_THRE_DEG: 15.0
+  DIR_STD_THRE_DEG: 45.0
   # 至少多少比例轨迹方向接近群体主方向
   DIR_CONS_RATIO: 0.75
   # 开关日志
   DEBUG: False
 
+OUTPUT_TRAJ_NMS:
+  ENABLE: True
+
+  # 使用输出阶段 NMS，只影响最终输出，不删除轨迹
+  MODE: "NEIGHBOR_AWARE_NMS"
+
+  # 是否使用统一距离策略
+  USE_DISTANCE_POLICY: True
+  # 距离感知 NMS 阈值
+  IOU_THRE_BY_DIST:
+    ENABLE: True
+    NEAR: {0: 0.3}
+    MID: {0: 0.5}
+    FAR: {0: 0.68}
+  # 兜底 IoU 阈值
+  IOU_THRE: 0.30
+  # 当前框被邻居覆盖比例
+  COVER_RATIO_THRE: 0.83
+  # 邻居框被当前框覆盖比例，处理包含关系
+  CONTAIN_RATIO_THRE: 0.83
+  # 如果一个框至少和 2 个邻居重叠，认为可能是局部桥接框
+  MIN_NEIGHBORS_FOR_BRIDGE: 2
+  # 当前框面积比邻居平均面积大多少，认为像桥接误检
+  LARGE_AREA_RATIO: 1.08
+  # 桥接惩罚，降低它的 NMS 排序分数
+  BRIDGE_SCORE_PENALTY: 0.3
+
+  DEBUG: False
+  PRINT_SUMMARY: False
+
 OUTPUT_FILTER:
   ENABLE: True
-  # 与 DISTANCE_POLICY 保持一致；当前代码如果还没读取这个字段，则先作为实验配置记录。
-  USE_DISTANCE_POLICY: True
-  MIN_OUTPUT_SCORE_BY_DIST:
-    ENABLE: True
-    NEAR: {0: 0.45}
-    MID: {0: 0.40}
-    FAR: {0: 0.30}
-  MIN_OUTPUT_TRACK_LENGTH: { 0: 3}
-  MIN_OUTPUT_SCORE: { 0: 0.40 }
-  FAR_DIST: { 0: 50.0 }
-  FAR_MIN_OUTPUT_SCORE: { 0: 0.50 }
-  MAX_LOST_OUTPUT_LENGTH: { 0: 1 }
-  SHORT_TRAJ_LENGTH: { 0: 3 }
-  SHORT_TRAJ_AVG_SCORE: { 0: 0.60 }
+  # 新生轨迹延迟确认，保留
+  MIN_OUTPUT_TRACK_LENGTH: {0: 3}
+  # 近中距离新生轨迹的最低输出分数
+  MIN_OUTPUT_SCORE: {0: 0.50}
+  # 与 DISTANCE_POLICY.MID_DIST 对齐
+  FAR_DIST: {0: 65.0}
+  # 远距离不要再设太高，否则会继续造成远距离 FN
+  FAR_MIN_OUTPUT_SCORE: {0: 0.30}
+  # 丢失预测框最多输出 1 帧，防止 fake bbox 拖太久
+  MAX_LOST_OUTPUT_LENGTH: {0: 1}
+  SHORT_TRAJ_LENGTH: {0: 3}
+  SHORT_TRAJ_AVG_SCORE: {0: 0.60}
   DEBUG: False
+
 EXP5A_OUT_OF_VIEW:
   ENABLE: True
-  PRINT_SUMMARY: True
+  PRINT_SUMMARY: False
   DEBUG: False
   IMAGE_WIDTH: 1242
   IMAGE_HEIGHT: 375
   REMAIN_RATIO_THRE: {0: 0.465}
   MIN_REF_AREA: {0: 130.0}
-
   REQUIRE_BOUNDARY_TOUCH: True
-  BOUNDARY_MARGIN: 0
+  BOUNDARY_MARGIN: 2
+
 FULL_IMAGE_BBOX_SOFT_IGNORE:
   ENABLE: True
   EDGE_MARGIN: 5.0
@@ -276,15 +301,16 @@ FULL_IMAGE_BBOX_SOFT_IGNORE:
   MIN_HEIGHT_RATIO: 0.90
   MIN_AREA_RATIO: 0.85
   DEBUG: False
-  PRINT_SUMMARY: True
+  PRINT_SUMMARY: False
+
 #新生轨迹遮挡抑制模块
 NEWBORN_OCCLUSION_SUPPRESS:
   ENABLE: True
   #被覆盖比例过高
-  OCCLUSION_RATIO_THRE: 0.62
+  OCCLUSION_RATIO_THRE: 0.80
   #另一个覆盖它的框，置信度要不要足够高
-  SCORE_TOLERANCE: 0.5
+  SCORE_TOLERANCE: 0.8
   #当前 detection 的 2D bbox 面积太小，就不参与这个遮挡抑制判断。
-  MIN_AREA: 80
+  MIN_AREA: 40
   DEBUG: False
-  PRINT_SUMMARY: True
+  PRINT_SUMMARY: False

@@ -12,6 +12,7 @@ from utils.utils import norm_realative_radian
 from tracker.detection_quality_filter import (
     soft_ignore_full_image_dets,
     is_highly_occluded_newborn_det,
+    output_traj_nms,
     get_det_score_safe,
 )
 
@@ -149,6 +150,10 @@ class Base3DTracker:
         }
         self.newborn_occlusion_suppress_stats = {
             "checked": 0,
+            "suppressed": 0,
+        }
+        self.output_traj_nms_stats = {
+            "checked_frames": 0,
             "suppressed": 0,
         }
 
@@ -474,6 +479,16 @@ class Base3DTracker:
                 "[NEWBORN_OCCLUSION_SUPPRESS_SUMMARY]",
                 "checked=", self.newborn_occlusion_suppress_stats.get("checked", 0),
                 "suppressed=", self.newborn_occlusion_suppress_stats.get("suppressed", 0),
+            )
+
+        output_traj_nms_cfg = self.cfg.get("OUTPUT_TRAJ_NMS", {})
+        if not isinstance(output_traj_nms_cfg, dict) or len(output_traj_nms_cfg) == 0:
+            output_traj_nms_cfg = self.cfg.get("THRESHOLD", {}).get("OUTPUT_TRAJ_NMS", {})
+        if bool(output_traj_nms_cfg.get("PRINT_SUMMARY", True)):
+            print(
+                "[OUTPUT_TRAJ_NMS_SUMMARY]",
+                "checked_frames=", self.output_traj_nms_stats.get("checked_frames", 0),
+                "suppressed=", self.output_traj_nms_stats.get("suppressed", 0),
             )
 
     def unmatch_update_with_hsm(self, track_id, frame_id):
@@ -813,6 +828,33 @@ class Base3DTracker:
                 del self.all_trajs[track_id]
 
         output_trajs = self.get_output_trajs(frame_info.frame_id)
+
+        # ------------------------------------------------------------
+        # 实验五E-4：输出阶段轨迹级 NMS
+        # ------------------------------------------------------------
+        # 这是 KITTI 路径真正生效的输出阶段 NMS。
+        # 它只处理当前帧 output_trajs 之间的邻居重叠，不删除轨迹，
+        # 不影响匹配，不影响 Kalman，只是不输出当前帧被 NMS 抑制的框。
+        # ------------------------------------------------------------
+        output_traj_nms_cfg = self.cfg.get("OUTPUT_TRAJ_NMS", {})
+        if not isinstance(output_traj_nms_cfg, dict) or len(output_traj_nms_cfg) == 0:
+            output_traj_nms_cfg = self.cfg.get("THRESHOLD", {}).get("OUTPUT_TRAJ_NMS", {})
+
+        if bool(output_traj_nms_cfg.get("ENABLE", False)):
+            self.output_traj_nms_stats["checked_frames"] = (
+                self.output_traj_nms_stats.get("checked_frames", 0) + 1
+            )
+
+            output_trajs, suppressed_output_ids = output_traj_nms(
+                output_trajs=output_trajs,
+                cfg=self.cfg,
+                frame_id=frame_info.frame_id,
+            )
+
+            self.output_traj_nms_stats["suppressed"] = (
+                self.output_traj_nms_stats.get("suppressed", 0)
+                + len(suppressed_output_ids)
+            )
 
         return output_trajs
 
