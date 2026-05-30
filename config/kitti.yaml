@@ -26,23 +26,23 @@ CATEGORY_MAP_TO_NUMBER : {
 # ---------------- distance policy ----------------
 # 统一管理近 / 中 / 远距离划分，后续所有和远近相关的模块都尽量复用这组阈值。
 # near: dist < 30m
-# mid : 30m <= dist < 50m
-# far : dist >= 50m
+# mid : 30m <= dist < 65m
+# far : dist >= 65m
 DISTANCE_POLICY:
   ENABLE: True
-  NEAR_DIST: {0: 30.0}
-  MID_DIST: {0: 65.0}
+  NEAR_DIST: &DIST_NEAR_CAR {0: 30.0}
+  MID_DIST: &DIST_FAR_START_CAR {0: 65.0}
 MATCHING:
   BEV:
     # Predict, BackPredict, Fusion
-    COST_STATE: {0: "Predict"}
+    COST_STATE: &COST_STATE_PREDICT_CAR {0: "Predict"}
     # iou_3d, giou_3d, dist_3d, ro_gdiou_3d
     COST_MODE: {0: "RO_GDIOU_3D"}
     MATCHING_MODE: Hungarian  # Hungarian, Greedy
   #图像平面匹配再把 BEV 没匹配上的轨迹和检测框拿去做 RV 匹配。RV 匹配成功后，代码还会额外检查 yaw 差和空间距离
   RV:
     # Predict, BackPredict, Fusion
-    COST_STATE: {0: "Predict"}
+    COST_STATE: *COST_STATE_PREDICT_CAR
     # iou_2d, iou_2d, diou_2d, sdiou_2d
     COST_MODE: {0: "SDIOU_2D"}
     MATCHING_MODE : Greedy  # Hungarian, Greedy
@@ -93,7 +93,7 @@ THRESHOLD:
 #位置运动模型
 KALMAN_FILTER_POSE:
   #CA匀加速模型，CTRA恒定转弯率+加速度模型
-  MOTION_MODE: {0: "CV"} # CV, CA, CTRA
+  MOTION_MODE: &MOTION_MODE_CV_CAR {0: "CV"} # CV, CA, CTRA
   CV:
     N: 4   # State Dimension
     M: 2   # Measure Dimension
@@ -105,7 +105,7 @@ KALMAN_FILTER_POSE:
         Q: [0.5, 0.5, 5, 5]
         #非常相信检测到的位置
         R: [0.1, 0.1]
-  CA:
+  CA: &POSE_ACCEL_MODEL_COMMON
     N: 6   # State Dimension
     M: 2   # Measure Dimension
     NOISE:
@@ -113,18 +113,11 @@ KALMAN_FILTER_POSE:
         P: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         Q: [2.0, 2.0, 1.0, 0.5, 1.0, 1.5]
         R: [0.5, 0.5]
-  CTRA:
-    N: 6   # State Dimension
-    M: 2   # Measure Dimension
-    NOISE:
-      0:
-        P: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-        Q: [2.0, 2.0, 1.0, 0.5, 1.0, 1.5]
-        R: [0.5, 0.5]
+  CTRA: *POSE_ACCEL_MODEL_COMMON
 
 #尺寸滤波
 KALMAN_FILTER_SIZE:
-  MOTION_MODE: {0: "CV"}
+  MOTION_MODE: *MOTION_MODE_CV_CAR
   CV:
     N: 4   # State Dimension
     M: 2   # Measure Dimension
@@ -135,7 +128,7 @@ KALMAN_FILTER_SIZE:
         R: [0.02, 0.02]
 #朝向角滤波
 KALMAN_FILTER_YAW:
-  MOTION_MODE: {0: "CV"}
+  MOTION_MODE: *MOTION_MODE_CV_CAR
   CV:
     N: 2   # State Dimension
     M: 2   # Measure Dimension
@@ -146,7 +139,7 @@ KALMAN_FILTER_YAW:
         R: [0.2, 5.0]
 #图像框滤波
 KALMAN_FILTER_RVBOX:
-  MOTION_MODE: {0: "CV"}
+  MOTION_MODE: *MOTION_MODE_CV_CAR
   CV:
     N: 8   # State Dimension
     M: 4   # Measure Dimension
@@ -203,9 +196,9 @@ HSM_LTM:
     MIN_REF_NUM: {0: 2}
   # 相似度权重
   WEIGHT:
-    DIR: {0: 0.3}
-    SPEED: {0: 0.3}
-    DIST: {0: 0.3}
+    DIR: &HSM_WEIGHT_03 {0: 0.3}
+    SPEED: *HSM_WEIGHT_03
+    DIST: *HSM_WEIGHT_03
     SCORE: {0: 0.1}
 
   PREDICTION:
@@ -254,9 +247,9 @@ OUTPUT_TRAJ_NMS:
   # 兜底 IoU 阈值
   IOU_THRE: 0.30
   # 当前框被邻居覆盖比例
-  COVER_RATIO_THRE: 0.83
+  COVER_RATIO_THRE: &OVERLAP_RATIO_083 0.83
   # 邻居框被当前框覆盖比例，处理包含关系
-  CONTAIN_RATIO_THRE: 0.83
+  CONTAIN_RATIO_THRE: *OVERLAP_RATIO_083
   # 如果一个框至少和 2 个邻居重叠，认为可能是局部桥接框
   MIN_NEIGHBORS_FOR_BRIDGE: 2
   # 当前框面积比邻居平均面积大多少，认为像桥接误检
@@ -271,13 +264,13 @@ OUTPUT_FILTER:
   ENABLE: True
   MIN_OUTPUT_TRACK_LENGTH: {0: 8}
   MIN_OUTPUT_SCORE: {0: 0.50}
-  FAR_DIST: {0: 65.0}
+  FAR_DIST: *DIST_FAR_START_CAR
   FAR_MIN_OUTPUT_SCORE: {0: 0.30}
 
   # 如果某个 car 轨迹这一帧没有匹配到检测框，但内部还能预测它的位置，那么最多只允许继续输出 1 帧预测框。
   MAX_LOST_OUTPUT_LENGTH: {0: 10}
 
-  SHORT_TRAJ_LENGTH: {0: 3}
+  SHORT_TRAJ_LENGTH: {0: 10}
   #如果一条轨迹很短，比如长度不超过 3 帧，那么它的平均 score 必须达到 0.60，才更可能被输出。
   SHORT_TRAJ_AVG_SCORE: {0: 0.50}
   DEBUG: False
