@@ -84,7 +84,7 @@ THRESHOLD:
     CONFIRMED_TRACK_LENGTH: {0: 1}
     DELET_OUT_VIEW_LENGTH: {0: 0}
     #判断轨迹是否足够可靠检测框本身分数高
-    CONFIRMED_DET_SCORE: {0: 0.7}
+    CONFIRMED_DET_SCORE: {0: 0.4}
     #不输出纯预测轨迹的框
     IS_FILTER_PREDICT_BOX: {0: 0.1}
     #匹配质量还可以
@@ -172,13 +172,13 @@ HSM_LTM:
     # 静止判断阈值
     # 这里对应你之前分析过的 zero_eps=0.02
     # 表示相邻帧中心点 BEV 位移接近 0 才认为是静止候选
-    STATIC_DISP_THRE: {0: 0.02}
+    STATIC_DISP_THRE: {0: 0.01}
     # 是否要求 HISTORY_WINDOW 内每一段位移都小于阈值
     # 建议 True，比平均位移更严格
     REQUIRE_ALL_STATIC: True
     # 静止目标的预测方式
     # KALMAN_ONLY 表示静止目标不使用群体运动
-    STATIC_PRED_MODE: "KALMAN_ONLY"
+    STATIC_PRED_MODE: "EGO_REFBOX"
     # 运动目标的预测方式
     # ORIGINAL_HSM_LTM 表示完全沿用你之前实验一的 HSM_LTM 逻辑
     MOVING_PRED_MODE: "ORIGINAL_HSM_LTM"
@@ -262,37 +262,49 @@ OUTPUT_TRAJ_NMS:
   # 当前框面积比邻居平均面积大多少，认为像桥接误检
   LARGE_AREA_RATIO: 1.08
   # 桥接惩罚，降低它的 NMS 排序分数
-  BRIDGE_SCORE_PENALTY: 0.3
+  BRIDGE_SCORE_PENALTY: 0.32
 
   DEBUG: False
   PRINT_SUMMARY: False
 
 OUTPUT_FILTER:
   ENABLE: True
-  # 新生轨迹延迟确认，保留
-  MIN_OUTPUT_TRACK_LENGTH: {0: 3}
-  # 近中距离新生轨迹的最低输出分数
+  MIN_OUTPUT_TRACK_LENGTH: {0: 8}
   MIN_OUTPUT_SCORE: {0: 0.50}
-  # 与 DISTANCE_POLICY.MID_DIST 对齐
   FAR_DIST: {0: 65.0}
-  # 远距离不要再设太高，否则会继续造成远距离 FN
   FAR_MIN_OUTPUT_SCORE: {0: 0.30}
-  # 丢失预测框最多输出 1 帧，防止 fake bbox 拖太久
-  MAX_LOST_OUTPUT_LENGTH: {0: 1}
+
+  # 如果某个 car 轨迹这一帧没有匹配到检测框，但内部还能预测它的位置，那么最多只允许继续输出 1 帧预测框。
+  MAX_LOST_OUTPUT_LENGTH: {0: 10}
+
   SHORT_TRAJ_LENGTH: {0: 3}
-  SHORT_TRAJ_AVG_SCORE: {0: 0.60}
+  #如果一条轨迹很短，比如长度不超过 3 帧，那么它的平均 score 必须达到 0.60，才更可能被输出。
+  SHORT_TRAJ_AVG_SCORE: {0: 0.50}
   DEBUG: False
 
 EXP5A_OUT_OF_VIEW:
   ENABLE: True
-  PRINT_SUMMARY: False
+  PRINT_SUMMARY: True
   DEBUG: False
+  DEBUG_CANDIDATE: False
   IMAGE_WIDTH: 1242
   IMAGE_HEIGHT: 375
-  REMAIN_RATIO_THRE: {0: 0.465}
+  REMAIN_RATIO_THRE: {0: 0.46}
   MIN_REF_AREA: {0: 130.0}
   REQUIRE_BOUNDARY_TOUCH: True
   BOUNDARY_MARGIN: 2
+
+  STATIC_EGO_EXIT:
+    ENABLE: True
+    DEBUG: False
+    PRINT_SUMMARY: True
+
+    # 核心阈值：裁剪后剩余面积 <= 最大完整框面积的 10%，停止输出
+    STOP_REMAIN_RATIO_THRE: {0: 0.01}
+    # 只给已经确认输出过的老轨迹做静止延伸
+    REQUIRE_ALREADY_OUTPUT: True
+    # 给延伸框一个正常输出分数，避免被普通 fake bbox 分数过滤
+    PRESERVED_OUTPUT_SCORE: {0: 0.6}
 
 FULL_IMAGE_BBOX_SOFT_IGNORE:
   ENABLE: True

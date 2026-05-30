@@ -3,6 +3,7 @@
 # ------------------------------------------------------------------------
 
 import numpy as np
+import copy
 
 from tracker.matching import *
 from tracker.trajectory import Trajectory
@@ -144,6 +145,31 @@ class Base3DTracker:
             "small_ratio_candidate": 0,
             "min_remain_ratio": 999.0,
         }
+        # ------------------------------------------------------------
+        # EXP5A STATIC_EGO_EXIT:
+        # 仅用于“静止车辆出界判断”。
+        # 不修改 GROUP_MOTION / HSM_LTM 的群体运动估计逻辑。
+        # 核心思想：静止车自身速度为 0 时，用自车/相机位姿变化
+        # 重新投影最后一次完整 3D 参考框，判断是否已经离开图像视野。
+        # ------------------------------------------------------------
+        self.exp5a_static_ego_stats = {
+            "checked": 0,
+            # preserved 是真正“无检测框时继续输出预测框”的次数
+            "preserved": 0,
+            # out_of_view_stop 是裁剪后剩余面积 <= 阈值，停止输出预测框的次数
+            "out_of_view_stop": 0,
+            "terminated": 0,
+            "not_out": 0,
+            "skip_disabled": 0,
+            "skip_not_static": 0,
+            "skip_no_ref3d": 0,
+            "skip_no_ref2d": 0,
+            "skip_not_output": 0,
+            "skip_finished": 0,
+            "skip_no_transform": 0,
+            "projection_failed": 0,
+            "min_remain_ratio": 999.0,
+        }
         self.full_image_bbox_ignore_stats = {
             "checked_frames": 0,
             "ignored": 0,
@@ -162,6 +188,667 @@ class Base3DTracker:
 
     def _exp5a_enabled(self):
         return bool(self._get_exp5a_cfg().get("ENABLE", True))
+
+    def _get_static_ego_exit_cfg_exp5a(self):
+        """
+        静止车辆自车运动出界配置。
+        该配置只服务 EXP5A 的静止车辆出界判断，不影响原有 GROUP_MOTION。
+        """
+        cfg = self._get_exp5a_cfg()
+        sub_cfg = cfg.get("STATIC_EGO_EXIT", {})
+        if not isinstance(sub_cfg, dict):
+            sub_cfg = {}
+        return sub_cfg
+
+    def _static_ego_exit_enabled_exp5a(self):
+        cfg = self._get_static_ego_exit_cfg_exp5a()
+        # 默认开启：因为这个函数只会在“静止 unmatched 轨迹”里被调用，
+        # 且投影失败时不会删除轨迹。
+        return bool(cfg.get("ENABLE", True))
+
+    def _as_matrix_exp5a(self, value, shape=None):
+        if value is None:
+            return None
+        try:
+            arr = np.asarray(value, dtype=float)
+        except Exception:
+            return None
+        if arr.ndim != 2:
+            return None
+        if shape is not None and arr.shape != shape:
+            return None
+        if not np.all(np.isfinite(arr)):
+            return None
+        return arr
+
+    def _get_matrix_by_keys_exp5a(self, data, keys):
+        if not isinstance(data, dict):
+            return None
+        lower_map = {str(k).lower(): k for k in data.keys()}
+        for key in keys:
+            real_key = lower_map.get(str(key).lower(), None)
+            if real_key is None:
+                continue
+            mat = self._as_matrix_exp5a(data.get(real_key))
+            if mat is not None:
+                return mat
+        return None
+
+    def _safe_inv_exp5a(self, mat):
+        mat = self._as_matrix_exp5a(mat)
+        if mat is None:
+            return None
+        try:
+            return np.linalg.inv(mat)
+        except Exception:
+            return None
+
+    def _to_homo_exp5a(self, points_xyz):
+        pts = np.asarray(points_xyz, dtype=float)
+        ones = np.ones((pts.shape[0], 1), dtype=float)
+        return np.concatenate([pts, ones], axis=1)
+
+    def _transform_points_exp5a(self, points_xyz, mat):
+        mat = self._as_matrix_exp5a(mat)
+        if mat is None:
+            return None
+        pts_h = self._to_homo_exp5a(points_xyz)
+        if mat.shape == (4, 4):
+            out = (mat @ pts_h.T).T
+            return out[:, :3]
+        if mat.shape == (3, 4):
+            out = (mat @ pts_h.T).T
+            return out[:, :3]
+        if mat.shape == (3, 3):
+            out = (mat @ np.asarray(points_xyz, dtype=float).T).T
+            return out[:, :3]
+        return None
+
+    def _project_camera_points_exp5a(self, points_cam, camera2image):
+        """
+        将 camera 坐标系下的 3D 点投影到图像平面。
+
+        MCTrack BaseVersion 的相机投影字段叫 camera2image，
+        不是 camera_intrinsic。这里同时兼容：
+        - 3x3 内参矩阵 K
+        - 3x4 camera2image 投影矩阵
+        - 4x4 camera2image 齐次投影矩阵
+        """
+        P = self._as_matrix_exp5a(camera2image)
+        pts = np.asarray(points_cam, dtype=float)
+        if P is None:
+            return None, None
+        if pts.ndim != 2 or pts.shape[1] < 3:
+            return None, None
+
+        depth = pts[:, 2]
+        valid = depth > 1e-4
+        if not np.any(valid):
+            return np.empty((0, 2), dtype=float), depth
+
+        pts_valid = pts[valid, :3]
+
+        if P.shape == (3, 3):
+            proj = (P @ pts_valid.T).T
+        elif P.shape[0] >= 3 and P.shape[1] >= 4:
+            pts_h = self._to_homo_exp5a(pts_valid)
+            proj = (P[:3, :4] @ pts_h.T).T
+        else:
+            return None, None
+
+        if proj.shape[1] < 3:
+            return None, None
+
+        uv = proj[:, :2] / np.maximum(proj[:, 2:3], 1e-6)
+        return uv, depth[valid]
+
+    def _get_bbox_global_box_exp5a(self, bbox):
+        """
+        读取 bbox 的全局 3D 框 [x, y, z, l, w, h, yaw]。
+        优先使用 fusion，因为它是当前 tracker 内部滤波后的稳定状态。
+        """
+        for name in ["global_xyz_lwh_yaw_fusion", "global_xyz_lwh_yaw"]:
+            if not hasattr(bbox, name):
+                continue
+            value = getattr(bbox, name)
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value, dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if arr.shape[0] >= 7 and np.all(np.isfinite(arr[:7])):
+                return arr[:7].copy()
+        return None
+
+    def _box3d_corners_global_exp5a(self, box3d):
+        """
+        根据全局 3D 框生成 8 个角点。
+        box3d = [x, y, z, l, w, h, yaw]
+        """
+        arr = np.asarray(box3d, dtype=float).reshape(-1)
+        if arr.shape[0] < 7:
+            return None
+        x, y, z, l, w, h, yaw = arr[:7]
+        if l <= 0 or w <= 0 or h <= 0:
+            return None
+
+        # 以 bbox 中心为中心，z 方向上下各 h/2。
+        x_c = np.array([l / 2, l / 2, -l / 2, -l / 2, l / 2, l / 2, -l / 2, -l / 2])
+        y_c = np.array([w / 2, -w / 2, -w / 2, w / 2, w / 2, -w / 2, -w / 2, w / 2])
+        z_c = np.array([h / 2, h / 2, h / 2, h / 2, -h / 2, -h / 2, -h / 2, -h / 2])
+
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        rot = np.array([
+            [cos_yaw, -sin_yaw, 0.0],
+            [sin_yaw, cos_yaw, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+        corners = np.stack([x_c, y_c, z_c], axis=0)
+        corners = (rot @ corners).T
+        corners += np.array([x, y, z], dtype=float)
+        return corners
+
+    def _get_camera_info_exp5a(self, frame_info=None, camera_type=None):
+        if frame_info is None or not hasattr(frame_info, "transform_matrix"):
+            return None, None, None
+        transform_matrix = getattr(frame_info, "transform_matrix")
+        if not isinstance(transform_matrix, dict):
+            return transform_matrix, None, None
+
+        cameras = transform_matrix.get("cameras_transform_matrix", None)
+        if not isinstance(cameras, dict) or len(cameras) == 0:
+            return transform_matrix, None, None
+
+        cam_info = None
+        cam_key = None
+        if camera_type in cameras:
+            cam_key = camera_type
+            cam_info = cameras[camera_type]
+        else:
+            # camera_type 不存在时，退回第一个相机，保证不会因为字段缺失直接报错。
+            cam_key = list(cameras.keys())[0]
+            cam_info = cameras[cam_key]
+
+        if not isinstance(cam_info, dict):
+            return transform_matrix, cam_key, None
+        return transform_matrix, cam_key, cam_info
+
+    def _compose_global_to_camera_exp5a(self, transform_matrix, cam_info):
+        """
+        尽量从 MCTrack/KITTI 常见 transform_matrix 结构中拼出 global -> camera。
+        支持：
+        1. cam_info 直接提供 global2camera；
+        2. root 提供 global2ego，cam_info 提供 ego2camera；
+        3. root 提供 global2lidar，cam_info 提供 lidar2camera；
+        4. 对应反向矩阵存在时自动求逆。
+        """
+        if not isinstance(transform_matrix, dict) or not isinstance(cam_info, dict):
+            return None
+
+        direct = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            ["global2camera", "global_to_camera", "global2cam", "global_to_cam"],
+        )
+        if direct is not None:
+            return direct
+
+        # global -> ego -> camera
+        global2ego = self._get_matrix_by_keys_exp5a(
+            transform_matrix,
+            ["global2ego", "global_to_ego"],
+        )
+        if global2ego is None:
+            ego2global = self._get_matrix_by_keys_exp5a(
+                transform_matrix,
+                ["ego2global", "ego_to_global"],
+            )
+            global2ego = self._safe_inv_exp5a(ego2global)
+
+        ego2camera = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            ["ego2camera", "ego_to_camera", "ego2cam", "ego_to_cam"],
+        )
+        if ego2camera is None:
+            camera2ego = self._get_matrix_by_keys_exp5a(
+                cam_info,
+                ["camera2ego", "camera_to_ego", "cam2ego", "cam_to_ego"],
+            )
+            ego2camera = self._safe_inv_exp5a(camera2ego)
+
+        if global2ego is not None and ego2camera is not None:
+            return ego2camera @ global2ego
+
+        # global -> lidar -> camera
+        global2lidar = self._get_matrix_by_keys_exp5a(
+            transform_matrix,
+            ["global2lidar", "global_to_lidar"],
+        )
+        if global2lidar is None:
+            lidar2global = self._get_matrix_by_keys_exp5a(
+                transform_matrix,
+                ["lidar2global", "lidar_to_global"],
+            )
+            global2lidar = self._safe_inv_exp5a(lidar2global)
+
+        lidar2camera = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            ["lidar2camera", "lidar_to_camera", "lidar2cam", "lidar_to_cam"],
+        )
+        if lidar2camera is None:
+            camera2lidar = self._get_matrix_by_keys_exp5a(
+                cam_info,
+                ["camera2lidar", "camera_to_lidar", "cam2lidar", "cam_to_lidar"],
+            )
+            lidar2camera = self._safe_inv_exp5a(camera2lidar)
+
+        if global2lidar is not None and lidar2camera is not None:
+            return lidar2camera @ global2lidar
+
+        return None
+
+    def _project_global_box_to_image_exp5a(self, box3d, frame_info=None, camera_type=None):
+        """
+        将保存的静止目标全局 3D 框按当前帧自车/相机位姿投影到图像。
+        返回：xyxy, image_w, image_h, camera_key
+        如果无法获得投影链路，返回 None。
+        """
+        corners_global = self._box3d_corners_global_exp5a(box3d)
+        if corners_global is None:
+            return None
+
+        transform_matrix, cam_key, cam_info = self._get_camera_info_exp5a(frame_info, camera_type)
+        if transform_matrix is None or cam_info is None:
+            return None
+
+        # 读取图像尺寸
+        image_w, image_h = self._get_image_shape_exp5a(bbox=None, frame_info=frame_info)
+        if isinstance(cam_info, dict) and "image_shape" in cam_info:
+            shape = cam_info.get("image_shape")
+            if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                a, b = int(shape[0]), int(shape[1])
+                if a <= b:
+                    image_h, image_w = a, b
+                else:
+                    image_w, image_h = a, b
+
+        # 方式 1：直接 global -> image 投影矩阵
+        P_global2image = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            ["global2image", "global_to_image", "global2img", "global_to_img"],
+        )
+        if P_global2image is not None and P_global2image.shape in [(3, 4), (4, 4)]:
+            pts_h = self._to_homo_exp5a(corners_global)
+            proj = (P_global2image @ pts_h.T).T
+            if proj.shape[1] >= 3:
+                valid = proj[:, 2] > 1e-4
+                if not np.any(valid):
+                    return [1e9, 1e9, 1e9 + 1.0, 1e9 + 1.0], image_w, image_h, cam_key
+                uv = proj[valid, :2] / np.maximum(proj[valid, 2:3], 1e-6)
+                return [float(np.min(uv[:, 0])), float(np.min(uv[:, 1])), float(np.max(uv[:, 0])), float(np.max(uv[:, 1]))], image_w, image_h, cam_key
+
+        # MCTrack BaseVersion 中标准字段是 camera2image，README 中明确给出：
+        # cameras_transform_matrix/CAM_*/camera2image。
+        # 这里也兼容少数实现里可能出现的 intrinsic/K 命名。
+        camera2image = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            [
+                "camera2image", "camera_to_image", "cam2image", "cam_to_image",
+                "camera_intrinsic", "cam_intrinsic", "intrinsic", "K", "camera_K", "cam_K",
+            ],
+        )
+        if camera2image is None:
+            if bool(self._get_static_ego_exit_cfg_exp5a().get("DEBUG", False)):
+                print(
+                    "[EXP5A_STATIC_EGO_EXIT_NO_CAMERA2IMAGE]",
+                    "cam_key=", cam_key,
+                    "cam_info_keys=", list(cam_info.keys()) if isinstance(cam_info, dict) else None,
+                )
+            return None
+
+        global2camera = self._compose_global_to_camera_exp5a(transform_matrix, cam_info)
+        if global2camera is None:
+            if bool(self._get_static_ego_exit_cfg_exp5a().get("DEBUG", False)):
+                print(
+                    "[EXP5A_STATIC_EGO_EXIT_NO_GLOBAL2CAMERA]",
+                    "root_keys=", list(transform_matrix.keys()) if isinstance(transform_matrix, dict) else None,
+                    "cam_key=", cam_key,
+                    "cam_info_keys=", list(cam_info.keys()) if isinstance(cam_info, dict) else None,
+                )
+            return None
+
+        corners_cam = self._transform_points_exp5a(corners_global, global2camera)
+        if corners_cam is None:
+            return None
+
+        uv, depths = self._project_camera_points_exp5a(corners_cam, camera2image)
+        if uv is None:
+            return None
+        if uv.shape[0] == 0:
+            # 全部在相机后方，视为完全出界。
+            return [1e9, 1e9, 1e9 + 1.0, 1e9 + 1.0], image_w, image_h, cam_key
+
+        x1, y1 = np.min(uv[:, 0]), np.min(uv[:, 1])
+        x2, y2 = np.max(uv[:, 0]), np.max(uv[:, 1])
+        return [float(x1), float(y1), float(x2), float(y2)], image_w, image_h, cam_key
+
+    def _remain_ratio_for_projected_xyxy_exp5a(self, xyxy, image_w, image_h, ref_area):
+        x1, y1, x2, y2 = np.asarray(xyxy, dtype=float).reshape(4)
+        if x2 <= x1 or y2 <= y1:
+            return 0.0, 0.0
+        ix1 = max(0.0, x1)
+        iy1 = max(0.0, y1)
+        ix2 = min(float(image_w - 1), x2)
+        iy2 = min(float(image_h - 1), y2)
+        inter_w = max(0.0, ix2 - ix1)
+        inter_h = max(0.0, iy2 - iy1)
+        inter_area = inter_w * inter_h
+        remain_ratio = float(inter_area / max(float(ref_area), 1e-6))
+        return remain_ratio, float(inter_area)
+
+    def _update_static_ego_reference_exp5a(self, traj, bbox, frame_info=None, source="matched"):
+        """
+        只在更新“历史最大完整 2D 框”时同步保存对应的 3D 全局框。
+        后续静止目标 unmatched 后，用当前帧自车/相机位姿重投影这个 3D 框。
+        """
+        box3d = self._get_bbox_global_box_exp5a(bbox)
+        if box3d is None:
+            return False
+        traj.exp5a_static_ego_ref_global_box = box3d.copy()
+        traj.exp5a_static_ego_ref_frame = getattr(frame_info, "frame_id", -1) if frame_info is not None else -1
+        traj.exp5a_static_ego_ref_camera_type = self._get_camera_type_exp5a(bbox)
+        traj.exp5a_static_ego_ref_source = source
+        # 保存一份 transform 仅用于调试，不参与正常 GROUP_MOTION。
+        if frame_info is not None and hasattr(frame_info, "transform_matrix"):
+            try:
+                traj.exp5a_static_ego_ref_transform_matrix = copy.deepcopy(frame_info.transform_matrix)
+            except Exception:
+                traj.exp5a_static_ego_ref_transform_matrix = None
+        return True
+
+    def _project_global_center_to_image_exp5a(self, box3d, frame_info=None, camera_type=None):
+        """
+        只投影静止目标历史参考 3D 框的中心点。
+        注意：这里不再投影 3D 八角点生成 2D 大框，避免自车靠近时投影框异常放大。
+        后续用历史最大 2D 参考框的宽高，在这个中心点上重建预测框。
+        """
+        arr = np.asarray(box3d, dtype=float).reshape(-1)
+        if arr.shape[0] < 3 or not np.all(np.isfinite(arr[:3])):
+            return None
+
+        center_global = arr[:3].reshape(1, 3)
+
+        transform_matrix, cam_key, cam_info = self._get_camera_info_exp5a(frame_info, camera_type)
+        if transform_matrix is None or cam_info is None:
+            return None
+
+        image_w, image_h = self._get_image_shape_exp5a(bbox=None, frame_info=frame_info)
+        if isinstance(cam_info, dict) and "image_shape" in cam_info:
+            shape = cam_info.get("image_shape")
+            if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+                a, b = int(shape[0]), int(shape[1])
+                if a <= b:
+                    image_h, image_w = a, b
+                else:
+                    image_w, image_h = a, b
+
+        # 方式 1：直接 global -> image
+        P_global2image = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            ["global2image", "global_to_image", "global2img", "global_to_img"],
+        )
+        if P_global2image is not None and P_global2image.shape in [(3, 4), (4, 4)]:
+            pts_h = self._to_homo_exp5a(center_global)
+            proj = (P_global2image @ pts_h.T).T
+            if proj.shape[1] >= 3 and proj[0, 2] > 1e-4:
+                uv = proj[0, :2] / max(float(proj[0, 2]), 1e-6)
+                return [float(uv[0]), float(uv[1])], image_w, image_h, cam_key
+            return None
+
+        camera2image = self._get_matrix_by_keys_exp5a(
+            cam_info,
+            [
+                "camera2image", "camera_to_image", "cam2image", "cam_to_image",
+                "camera_intrinsic", "cam_intrinsic", "intrinsic", "K", "camera_K", "cam_K",
+            ],
+        )
+        if camera2image is None:
+            return None
+
+        global2camera = self._compose_global_to_camera_exp5a(transform_matrix, cam_info)
+        if global2camera is None:
+            return None
+
+        center_cam = self._transform_points_exp5a(center_global, global2camera)
+        if center_cam is None or center_cam.shape[0] == 0:
+            return None
+        if float(center_cam[0, 2]) <= 1e-4:
+            return None
+
+        uv, depths = self._project_camera_points_exp5a(center_cam, camera2image)
+        if uv is None or uv.shape[0] == 0:
+            return None
+
+        return [float(uv[0, 0]), float(uv[0, 1])], image_w, image_h, cam_key
+
+    def _build_ref_xyxy_at_center_exp5a(self, ref_xyxy, center_uv):
+        """
+        使用历史最大完整 2D 检测框的宽高，在当前投影中心点处重建预测框。
+        这是用户要求的核心：不是输出重新投影出来的大框，而是移动之前保存的最大检测框。
+        """
+        ref = np.asarray(ref_xyxy, dtype=float).reshape(4)
+        u, v = float(center_uv[0]), float(center_uv[1])
+        ref_w = max(0.0, float(ref[2] - ref[0]))
+        ref_h = max(0.0, float(ref[3] - ref[1]))
+        if ref_w <= 1e-6 or ref_h <= 1e-6:
+            return None
+        return [
+            u - ref_w * 0.5,
+            v - ref_h * 0.5,
+            u + ref_w * 0.5,
+            v + ref_h * 0.5,
+        ]
+
+    def _clip_xyxy_to_image_exp5a(self, xyxy, image_w, image_h):
+        x1, y1, x2, y2 = np.asarray(xyxy, dtype=float).reshape(4)
+        cx1 = max(0.0, min(float(image_w - 1), x1))
+        cy1 = max(0.0, min(float(image_h - 1), y1))
+        cx2 = max(0.0, min(float(image_w - 1), x2))
+        cy2 = max(0.0, min(float(image_h - 1), y2))
+        if cx2 <= cx1 or cy2 <= cy1:
+            return [cx1, cy1, cx1, cy1], 0.0
+        area = float((cx2 - cx1) * (cy2 - cy1))
+        return [float(cx1), float(cy1), float(cx2), float(cy2)], area
+
+    def _set_bbox_image_xyxy_exp5a(self, bbox, xyxy):
+        """
+        将裁剪后的 2D 预测框写回 bbox。
+        若某些字段不存在则自动跳过，避免破坏原始 MCTrack 结构。
+        """
+        arr = np.asarray(xyxy, dtype=float).reshape(4).copy()
+        for name in ["x1y1x2y2", "x1y1x2y2_fusion", "x1y1x2y2_predict"]:
+            if hasattr(bbox, name):
+                try:
+                    setattr(bbox, name, arr.copy())
+                except Exception:
+                    pass
+
+    def _apply_static_ego_exit_exp5a(self, traj, frame_info=None, source="unmatched_static"):
+        """
+        EXP5A STATIC_EGO_PREDICT：自车运动引导的静止目标 2D 参考框延伸。
+
+        正确逻辑：
+        1. matched 阶段保存历史最大完整 2D 检测框 ref_xyxy / ref_area；
+        2. unmatched 且静止时，只投影历史 3D 参考框的中心点；
+        3. 用历史最大 2D 框的宽高，在当前中心点重建 pred_xyxy；
+        4. 将 pred_xyxy 裁剪到图像边界，得到 clip_xyxy；
+        5. clip_area / ref_area > 10%：继续输出裁剪后的预测框；
+        6. clip_area / ref_area <= 10%：停止输出这个静止预测框。
+
+        注意：不再使用 3D 八角点投影出的巨大 2D 框作为输出框。
+        """
+        if not self._exp5a_enabled() or not self._static_ego_exit_enabled_exp5a():
+            self.exp5a_static_ego_stats["skip_disabled"] = self.exp5a_static_ego_stats.get("skip_disabled", 0) + 1
+            return False
+        if traj is None or len(traj.bboxes) == 0:
+            return False
+
+        if bool(getattr(traj, "exp5a_static_ego_finished", False)):
+            self.exp5a_static_ego_stats["skip_finished"] = self.exp5a_static_ego_stats.get("skip_finished", 0) + 1
+            return False
+
+        cfg = self._get_exp5a_cfg()
+        ego_cfg = self._get_static_ego_exit_cfg_exp5a()
+        cls_id = getattr(traj, "category_num", 0)
+        bbox = traj.bboxes[-1]
+
+        self.exp5a_static_ego_stats["checked"] = self.exp5a_static_ego_stats.get("checked", 0) + 1
+
+        # 静止延伸只应该服务于已经确认输出过的老轨迹，避免给从未确认的新生轨迹制造 fake bbox。
+        if bool(ego_cfg.get("REQUIRE_ALREADY_OUTPUT", True)) and not bool(getattr(traj, "is_output", False)):
+            self.exp5a_static_ego_stats["skip_not_output"] = self.exp5a_static_ego_stats.get("skip_not_output", 0) + 1
+            return False
+
+        ref_box3d = getattr(traj, "exp5a_static_ego_ref_global_box", None)
+        ref_xyxy = getattr(traj, "exp5a_full_vehicle_ref_xyxy", None)
+        ref_area = float(getattr(traj, "exp5a_full_vehicle_ref_area", 0.0))
+
+        if ref_box3d is None or ref_area <= 1e-6:
+            self.exp5a_static_ego_stats["skip_no_ref3d"] = self.exp5a_static_ego_stats.get("skip_no_ref3d", 0) + 1
+            return False
+        if ref_xyxy is None:
+            self.exp5a_static_ego_stats["skip_no_ref2d"] = self.exp5a_static_ego_stats.get("skip_no_ref2d", 0) + 1
+            return False
+
+        camera_type = getattr(traj, "exp5a_static_ego_ref_camera_type", None)
+        center_proj = self._project_global_center_to_image_exp5a(
+            ref_box3d,
+            frame_info=frame_info,
+            camera_type=camera_type,
+        )
+        if center_proj is None:
+            self.exp5a_static_ego_stats["projection_failed"] = self.exp5a_static_ego_stats.get("projection_failed", 0) + 1
+            if bool(ego_cfg.get("DEBUG", False)):
+                print(
+                    "[EXP5A_STATIC_EGO_CENTER_PROJ_FAIL]",
+                    "track_id=", traj.track_id,
+                    "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                    "camera_type=", camera_type,
+                )
+            return False
+
+        center_uv, image_w, image_h, used_cam = center_proj
+        pred_xyxy = self._build_ref_xyxy_at_center_exp5a(ref_xyxy, center_uv)
+        if pred_xyxy is None:
+            self.exp5a_static_ego_stats["skip_no_ref2d"] = self.exp5a_static_ego_stats.get("skip_no_ref2d", 0) + 1
+            return False
+
+        clip_xyxy, clip_area = self._clip_xyxy_to_image_exp5a(pred_xyxy, image_w, image_h)
+        remain_ratio = float(clip_area / max(float(ref_area), 1e-6))
+
+        self.exp5a_static_ego_stats["min_remain_ratio"] = min(
+            float(self.exp5a_static_ego_stats.get("min_remain_ratio", 999.0)),
+            float(remain_ratio),
+        )
+
+        stop_thre = float(
+            _cfg_by_cls(
+                ego_cfg.get("STOP_REMAIN_RATIO_THRE", ego_cfg.get("DELETE_REMAIN_RATIO_THRE", cfg.get("REMAIN_RATIO_THRE", {0: 0.10}))),
+                cls_id,
+                0.10,
+            )
+        )
+
+        bbox.exp5a_static_ego_checked = True
+        bbox.exp5a_static_ego_center_uv = [float(center_uv[0]), float(center_uv[1])]
+        bbox.exp5a_static_ego_ref_xyxy = [float(v) for v in np.asarray(ref_xyxy, dtype=float).reshape(4)]
+        bbox.exp5a_static_ego_pred_xyxy = [float(v) for v in pred_xyxy]
+        bbox.exp5a_static_ego_clip_xyxy = [float(v) for v in clip_xyxy]
+        bbox.exp5a_static_ego_remain_ratio = float(remain_ratio)
+        bbox.exp5a_static_ego_inter_area = float(clip_area)
+        bbox.exp5a_static_ego_ref_area = float(ref_area)
+        bbox.exp5a_static_ego_camera = used_cam
+
+        # 裁剪后只剩 <= 10%，说明这辆静止车基本离开当前视野，停止输出预测框。
+        # 不在这里强制删除整条轨迹，生命周期交回原 MCTrack。
+        if remain_ratio <= stop_thre:
+            traj.exp5a_static_ego_finished = True
+            bbox.det_score = traj._is_filter_predict_box
+            bbox.exp5a_static_ego_preserved = False
+            bbox.exp5a_static_ego_stop_output = True
+            bbox.exp5a_static_ego_reason = "clipped_ref_box_area_le_threshold_stop_output"
+            bbox.exp5a_is_out_of_view = True
+            bbox.exp5a_out_view_source = source
+            bbox.exp5a_out_view_reason = "static_ego_clipped_ref_box_area_le_threshold"
+
+            self.exp5a_static_ego_stats["out_of_view_stop"] = self.exp5a_static_ego_stats.get("out_of_view_stop", 0) + 1
+            self.exp5a_static_ego_stats["terminated"] = self.exp5a_static_ego_stats.get("terminated", 0) + 1
+
+            if bool(ego_cfg.get("DEBUG", False)):
+                print(
+                    "[EXP5A_STATIC_EGO_REFBOX_STOP]",
+                    "track_id=", traj.track_id,
+                    "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                    "remain_ratio=", round(float(remain_ratio), 4),
+                    "clip_area=", round(float(clip_area), 2),
+                    "ref_area=", round(float(ref_area), 2),
+                    "center_uv=", [round(float(center_uv[0]), 1), round(float(center_uv[1]), 1)],
+                    "pred_xyxy=", [round(float(v), 1) for v in pred_xyxy],
+                    "clip_xyxy=", [round(float(v), 1) for v in clip_xyxy],
+                    "image_wh=", [image_w, image_h],
+                    "camera=", used_cam,
+                )
+            return False
+
+        # 还在视野内：输出“历史最大 2D 框移动后再裁剪”的预测框。
+        self._set_bbox_image_xyxy_exp5a(bbox, clip_xyxy)
+
+        # 3D 状态保持为静止目标历史参考框，避免 Kalman 0 速度 fake bbox 被其它更新污染。
+        try:
+            ref_box_arr = np.asarray(ref_box3d, dtype=float).reshape(-1)[:7].copy()
+            bbox.global_xyz_lwh_yaw = ref_box_arr.copy()
+            bbox.global_xyz_lwh_yaw_fusion = ref_box_arr.copy()
+            bbox.global_xyz_lwh_yaw_predict = ref_box_arr.copy()
+        except Exception:
+            pass
+
+        preserved_score = float(
+            _cfg_by_cls(
+                ego_cfg.get("PRESERVED_OUTPUT_SCORE", {0: 0.45}),
+                cls_id,
+                0.45,
+            )
+        )
+        try:
+            bbox.det_score = max(float(getattr(bbox, "det_score", 0.0)), preserved_score)
+        except Exception:
+            bbox.det_score = preserved_score
+
+        bbox.exp5a_static_ego_preserved = True
+        bbox.exp5a_static_ego_stop_output = False
+        bbox.exp5a_static_ego_reason = "ego_motion_ref_2d_box_clipped_preserve"
+
+        traj.exp5a_static_ego_keep_len = int(getattr(traj, "exp5a_static_ego_keep_len", 0)) + 1
+        self.exp5a_static_ego_stats["preserved"] = self.exp5a_static_ego_stats.get("preserved", 0) + 1
+        self.exp5a_static_ego_stats["not_out"] = self.exp5a_static_ego_stats.get("not_out", 0) + 1
+
+        if bool(ego_cfg.get("DEBUG", False)):
+            print(
+                "[EXP5A_STATIC_EGO_REFBOX_KEEP]",
+                "track_id=", traj.track_id,
+                "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                "keep_len=", traj.exp5a_static_ego_keep_len,
+                "remain_ratio=", round(float(remain_ratio), 4),
+                "center_uv=", [round(float(center_uv[0]), 1), round(float(center_uv[1]), 1)],
+                "pred_xyxy=", [round(float(v), 1) for v in pred_xyxy],
+                "clip_xyxy=", [round(float(v), 1) for v in clip_xyxy],
+                "ref_xyxy=", [round(float(v), 1) for v in np.asarray(ref_xyxy, dtype=float).reshape(4)],
+                "image_wh=", [image_w, image_h],
+                "camera=", used_cam,
+            )
+
+        return True
 
     def _get_bbox_image_xyxy_exp5a(self, bbox):
         """
@@ -335,6 +1022,10 @@ class Base3DTracker:
         traj.exp5a_full_vehicle_ref_xyxy = [info["x1"], info["y1"], info["x2"], info["y2"]]
         traj.exp5a_full_vehicle_ref_image_wh = [info["image_w"], info["image_h"]]
 
+        # 同步保存这个最大完整 2D 参考框对应的全局 3D 框。
+        # 后续只在静止 unmatched 轨迹的出界判断中使用。
+        self._update_static_ego_reference_exp5a(traj, bbox, frame_info, source=source)
+
         bbox.exp5a_full_vehicle_ref_area = cur_area
         bbox.exp5a_ref_update = True
         bbox.exp5a_full_vehicle_ref_xyxy = traj.exp5a_full_vehicle_ref_xyxy
@@ -465,6 +1156,23 @@ class Base3DTracker:
                 "min_remain_ratio=", round(float(self.exp5a_stats.get("min_remain_ratio", 999.0)), 4),
             )
 
+        ego_cfg = self._get_static_ego_exit_cfg_exp5a()
+        if bool(ego_cfg.get("PRINT_SUMMARY", cfg.get("PRINT_SUMMARY", True))):
+            print(
+                "[EXP5A_STATIC_EGO_EXIT_SUMMARY]",
+                "checked=", self.exp5a_static_ego_stats.get("checked", 0),
+                "preserved=", self.exp5a_static_ego_stats.get("preserved", 0),
+                "out_of_view_stop=", self.exp5a_static_ego_stats.get("out_of_view_stop", 0),
+                "terminated=", self.exp5a_static_ego_stats.get("terminated", 0),
+                "not_out=", self.exp5a_static_ego_stats.get("not_out", 0),
+                "skip_finished=", self.exp5a_static_ego_stats.get("skip_finished", 0),
+                "skip_not_output=", self.exp5a_static_ego_stats.get("skip_not_output", 0),
+                "skip_no_ref3d=", self.exp5a_static_ego_stats.get("skip_no_ref3d", 0),
+                "skip_no_ref2d=", self.exp5a_static_ego_stats.get("skip_no_ref2d", 0),
+                "projection_failed=", self.exp5a_static_ego_stats.get("projection_failed", 0),
+                "min_remain_ratio=", round(float(self.exp5a_static_ego_stats.get("min_remain_ratio", 999.0)), 4),
+            )
+
         full_image_cfg = self.cfg.get("FULL_IMAGE_BBOX_SOFT_IGNORE", {})
         if bool(full_image_cfg.get("PRINT_SUMMARY", True)):
             print(
@@ -491,7 +1199,7 @@ class Base3DTracker:
                 "suppressed=", self.output_traj_nms_stats.get("suppressed", 0),
             )
 
-    def unmatch_update_with_hsm(self, track_id, frame_id):
+    def unmatch_update_with_hsm(self, track_id, frame_id, frame_info=None):
         traj = self.all_trajs[track_id]
 
         hsm_cfg = self.cfg.get("HSM_LTM", {})
@@ -550,21 +1258,29 @@ class Base3DTracker:
         if traj.unmatch_length < start_unmatch_length:
             return
 
-        # 静止目标：只保留 Kalman，不进入 HSM_LTM
+        # 静止目标：不进入原 HSM_LTM 群体运动审查。
+        # 仅在这里额外做“自车运动引导的静止车辆出界判断”。
+        # 注意：这个逻辑只可能删除已经出界的静止轨迹，不改 GROUP_MOTION。
         if motion_state_enable and is_static_before_lost:
+            ego_preserved = self._apply_static_ego_exit_exp5a(
+                traj,
+                frame_info=frame_info,
+                source="unmatched_static_ego",
+            )
+
             if motion_cfg.get("DEBUG", False):
                 print(
                     "[HSM_LTM][MOTION_STATE]",
                     "track_id=", track_id,
                     "frame=", frame_id,
                     "state=static",
-                    "action=kalman_only",
+                    "action=static_ego_refbox_preserved" if ego_preserved else "kalman_only_static_ego_checked",
                     "unmatch_length=", traj.unmatch_length,
                 )
 
             if len(traj.bboxes) > 0:
                 traj.bboxes[-1].hsm_motion_state = "static"
-                traj.bboxes[-1].hsm_action = "kalman_only"
+                traj.bboxes[-1].hsm_action = "static_ego_refbox_preserved" if ego_preserved else "kalman_only_static_ego_checked"
 
             return
 
@@ -694,6 +1410,8 @@ class Base3DTracker:
                 self.all_trajs[track_id].update(
                     frame_info.bboxes[match_res[indexes, 1][0]], cost_matrix[indexes][0]
                 )
+                self.all_trajs[track_id].exp5a_static_ego_finished = False
+                self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
                 # 实验五A v6：先用历史完整面积判断当前框是否已经只剩车尾/车屁股。
                 # 如果没有删除，再把当前非贴边大框更新为新的完整参考面积。
                 exp5a_deleted = self._apply_out_of_view_termination_exp5a(
@@ -706,7 +1424,7 @@ class Base3DTracker:
             else:
                 unmatched_trajs[track_id] = self.all_trajs[track_id]
                 if not self.cfg["IS_RV_MATCHING"]:
-                    self.unmatch_update_with_hsm(track_id, frame_info.frame_id)
+                    self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
 
         init_bboxes = frame_info.bboxes
         if self.cfg["IS_RV_MATCHING"]:
@@ -749,11 +1467,13 @@ class Base3DTracker:
                         np.array(trk_bbox.global_xyz) - np.array(det_bbox.global_xyz)
                     )
                     if diff_rot > 90 or dist > 5:
-                        self.unmatch_update_with_hsm(track_id, frame_info.frame_id)
+                        self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
                         continue
                     self.all_trajs[track_id].update(
                         det_bbox, float(cost_matrix_inbev[indexes])
                     )
+                    self.all_trajs[track_id].exp5a_static_ego_finished = False
+                    self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
                     # 实验五A v6：RV 二次匹配后也先检查真实出界，再更新参考面积。
                     exp5a_deleted = self._apply_out_of_view_termination_exp5a(
                         self.all_trajs[track_id], frame_info, source="matched_rv"
@@ -763,7 +1483,7 @@ class Base3DTracker:
                             self.all_trajs[track_id], frame_info, source="matched_rv"
                         )
                 else:
-                    self.unmatch_update_with_hsm(track_id, frame_info.frame_id)
+                    self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
 
             matched_det_indices = set(match_res_inbev[:, 1])
             unmatched_det_indices = np.array(
@@ -861,35 +1581,42 @@ class Base3DTracker:
     def get_output_trajs(self, frame_id):
         output_trajs = {}
 
+        ego_cfg = self._get_static_ego_exit_cfg_exp5a()
+        require_confirmed_for_static_ego = bool(ego_cfg.get("REQUIRE_ALREADY_OUTPUT", True))
+
         for track_id in list(self.all_trajs.keys()):
             traj = self.all_trajs[track_id]
+            if len(traj.bboxes) == 0:
+                continue
 
-            if traj.status_flag == 1 or frame_id < 3:
-                bbox = traj.bboxes[-1]
+            bbox = traj.bboxes[-1]
+            static_ego_preserved = bool(getattr(bbox, "exp5a_static_ego_preserved", False))
 
-                # 保留原始 MCTrack 的预测框过滤逻辑
-                if bbox.det_score == traj._is_filter_predict_box:
+            # 原始 MCTrack 输出 confirmed 轨迹。
+            # 静止自车参考框延伸是特殊 fake bbox：即使 status_flag==2，也允许输出。
+            if not (traj.status_flag == 1 or frame_id < 3 or static_ego_preserved):
+                continue
+
+            already_confirmed = getattr(traj, "is_output", False)
+
+            if static_ego_preserved and require_confirmed_for_static_ego and not already_confirmed:
+                continue
+
+            # 普通预测框继续过滤；静止自车参考框延伸例外。
+            if (not static_ego_preserved) and bbox.det_score == traj._is_filter_predict_box:
+                continue
+
+            # 实验四：已经输出过的老轨迹不再走新生过滤。
+            # 静止自车参考框延伸来自老轨迹，也不走 OUTPUT_FILTER.MAX_LOST_OUTPUT_LENGTH。
+            if (not static_ego_preserved) and (not already_confirmed):
+                if not should_output_traj_bbox_exp3(traj, bbox, self.cfg):
                     continue
 
-                # ------------------------------------------------------------
-                # 实验四：新生轨迹延迟确认
-                # ------------------------------------------------------------
-                # 如果这条轨迹以前已经输出过，说明它已经被确认过，
-                # 后续不再用 OUTPUT_FILTER 卡它，避免增加 FN 和 Frag。
-                #
-                # 如果这条轨迹以前从未输出过，才使用实验三的输出过滤，
-                # 防止短轨迹、低分、远距离假阳性直接进入结果。
-                # ------------------------------------------------------------
-                already_confirmed = getattr(traj, "is_output", False)
-
-                if not already_confirmed:
-                    if not should_output_traj_bbox_exp3(traj, bbox, self.cfg):
-                        continue
-
-                output_trajs[track_id] = bbox
-                traj.is_output = True
+            output_trajs[track_id] = bbox
+            traj.is_output = True
 
         return output_trajs
+
     def post_processing(self):
         self._print_exp5a_summary()
         trajs = {}
