@@ -240,12 +240,12 @@ OUTPUT_TRAJ_NMS:
   IOU_THRE_BY_DIST:
     ENABLE: True
     NEAR: {0: 0.8}
-    MID: {0: 0.7}
+    MID: {0: 0.6}
     FAR: {0: 0.68}
   # 兜底 IoU 阈值
   IOU_THRE: 0.40
   # 当前框被邻居覆盖比例
-  COVER_RATIO_THRE: &OVERLAP_RATIO_083 0.8
+  COVER_RATIO_THRE: &OVERLAP_RATIO_083 0.83
   # 邻居框被当前框覆盖比例，处理包含关系
   CONTAIN_RATIO_THRE: *OVERLAP_RATIO_083
   # 如果一个框至少和 2 个邻居重叠，认为可能是局部桥接框
