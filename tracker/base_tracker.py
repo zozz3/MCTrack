@@ -1612,6 +1612,37 @@ class Base3DTracker:
                 if not should_output_traj_bbox_exp3(traj, bbox, self.cfg):
                     continue
 
+            # ------------------------------------------------------------
+            # 实验2：给 OUTPUT_TRAJ_NMS 提供轨迹生命周期信息
+            # 这些字段只用于当前帧输出 NMS，不改变轨迹状态、不影响匹配、不影响 Kalman。
+            # 注意：output_already_confirmed 必须在 traj.is_output = True 之前记录。
+            # ------------------------------------------------------------
+            bbox.output_track_id = int(track_id)
+            bbox.output_already_confirmed = bool(already_confirmed)
+
+            # 轨迹长度
+            bbox.output_track_length = int(getattr(traj, "track_length", len(traj.bboxes)))
+
+            # 未匹配长度，不同版本字段名可能不同，这里做兼容
+            bbox.output_unmatch_length = int(
+                getattr(
+                    traj,
+                    "unmatch_length",
+                    getattr(traj, "unmatched_length", 0)
+                )
+            )
+
+            bbox.output_status_flag = int(getattr(traj, "status_flag", -1))
+
+            # 当前框是否是 fake / predict bbox
+            try:
+                bbox.output_is_fake = bool(bbox.det_score == traj._is_filter_predict_box)
+            except Exception:
+                bbox.output_is_fake = bool(getattr(bbox, "is_fake", False))
+
+            # 静止自车参考框延伸也记录下来，方便后面保护
+            bbox.output_static_ego_preserved = bool(static_ego_preserved)
+
             output_trajs[track_id] = bbox
             traj.is_output = True
 

@@ -1,4 +1,6 @@
 
+import os
+import json
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from ._base_metric import _BaseMetric
@@ -41,15 +43,65 @@ class CLEAR(_BaseMetric):
         for field in self.fields:
             res[field] = 0
 
+        # Optional CLEAR event logger.
+        # Enable with:
+        #   export TRACKEVAL_CLEAR_DEBUG_DIR=vis/official_clear_events
+        #   export TRACKEVAL_CLEAR_DEBUG_FPS=10
+        #
+        # This logger records IDSW and Frag at the exact point where the official
+        # CLEAR metric computes them, after TrackEval/KITTI preprocessing.
+        debug_dir = os.environ.get('TRACKEVAL_CLEAR_DEBUG_DIR', '')
+        debug_fps = float(os.environ.get('TRACKEVAL_CLEAR_DEBUG_FPS', '10'))
+        debug_events = []
+
+        seq_name = str(data.get('seq', data.get('seq_name', data.get('sequence', 'unknown_seq'))))
+        cls_name = str(data.get('cls', data.get('cls_name', data.get('class', 'unknown_cls'))))
+        tracker_name = str(data.get('tracker', data.get('tracker_name', 'unknown_tracker')))
+
+        def _debug_safe_name(x):
+            x = str(x)
+            return ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in x)
+
+        def _debug_to_list(x):
+            try:
+                return np.asarray(x).tolist()
+            except Exception:
+                try:
+                    return list(x)
+                except Exception:
+                    return None
+
+        def _debug_get_frame_row(key, frame_idx, row_idx):
+            try:
+                return _debug_to_list(data[key][frame_idx][row_idx])
+            except Exception:
+                return None
+
+        def _debug_write_events():
+            if not debug_dir or len(debug_events) == 0:
+                return
+            os.makedirs(debug_dir, exist_ok=True)
+            out_name = (
+                f"clear_events_{_debug_safe_name(seq_name)}_"
+                f"{_debug_safe_name(cls_name)}_"
+                f"{os.getpid()}_{id(data)}.jsonl"
+            )
+            out_path = os.path.join(debug_dir, out_name)
+            with open(out_path, 'w', encoding='utf-8') as f:
+                for event in debug_events:
+                    f.write(json.dumps(event, ensure_ascii=False) + '\n')
+
         # Return result quickly if tracker or gt sequence is empty
         if data['num_tracker_dets'] == 0:
             res['CLR_FN'] = data['num_gt_dets']
             res['ML'] = data['num_gt_ids']
             res['MLR'] = 1.0
+            _debug_write_events()
             return res
         if data['num_gt_dets'] == 0:
             res['CLR_FP'] = data['num_tracker_dets']
             res['MLR'] = 1.0
+            _debug_write_events()
             return res
 
         # Variables counting global association
@@ -95,6 +147,78 @@ class CLEAR(_BaseMetric):
                 np.not_equal(matched_tracker_ids, prev_matched_tracker_ids))
             res['IDSW'] += np.sum(is_idsw)
 
+            # Debug event logging for IDSW and Frag.
+            #
+            # Frag in CLEAR is counted as the number of tracked fragments minus one
+            # for each GT trajectory. The internal gt_frag_count is incremented when
+            # a GT changes from "not tracked in the previous timestep" to "tracked now".
+            # Therefore, a real FRAG event is such a transition only if the GT has
+            # already been tracked before. This excludes the first time a GT is ever
+            # tracked, matching the final CLEAR Frag definition.
+            if debug_dir and len(matched_gt_ids) > 0:
+                prev_timestep_matched_tracker_ids = prev_timestep_tracker_id[matched_gt_ids]
+                was_not_tracked_prev_timestep = np.isnan(prev_timestep_matched_tracker_ids)
+                was_tracked_before = gt_frag_count[matched_gt_ids] > 0
+                is_frag = np.logical_and(was_tracked_before, was_not_tracked_prev_timestep)
+
+                for match_idx in range(len(matched_gt_ids)):
+                    if not bool(is_idsw[match_idx]) and not bool(is_frag[match_idx]):
+                        continue
+
+                    gt_row = int(match_rows[match_idx])
+                    tracker_col = int(match_cols[match_idx])
+                    frame_id = int(t)
+
+                    try:
+                        similarity_score = float(similarity[gt_row, tracker_col])
+                    except Exception:
+                        similarity_score = None
+
+                    prev_id = None
+                    if not np.isnan(prev_matched_tracker_ids[match_idx]):
+                        prev_id = int(prev_matched_tracker_ids[match_idx])
+
+                    prev_timestep_id = None
+                    if not np.isnan(prev_timestep_matched_tracker_ids[match_idx]):
+                        prev_timestep_id = int(prev_timestep_matched_tracker_ids[match_idx])
+
+                    base_event = {
+                        'seq': seq_name,
+                        'cls': cls_name,
+                        'tracker': tracker_name,
+                        'frame': frame_id,
+                        'time_sec': frame_id / debug_fps,
+                        'image_name': f'{frame_id:06d}.png',
+                        'gt_id': int(matched_gt_ids[match_idx]),
+                        'tracker_id': int(matched_tracker_ids[match_idx]),
+                        'prev_tracker_id': prev_id,
+                        'prev_timestep_tracker_id': prev_timestep_id,
+                        'similarity': similarity_score,
+                        'gt_row': gt_row,
+                        'tracker_col': tracker_col,
+                        'threshold': self.threshold,
+                        'gt_det': _debug_get_frame_row('gt_dets', t, gt_row),
+                        'tracker_det': _debug_get_frame_row('tracker_dets', t, tracker_col),
+                        'note': (
+                            'IDs are the IDs available inside TrackEval after '
+                            'KITTI preprocessing; use frame and bbox fields for '
+                            'visual localization if IDs were remapped.'
+                        ),
+                    }
+
+                    if bool(is_idsw[match_idx]):
+                        event = dict(base_event)
+                        event['event'] = 'IDSW'
+                        event['old_tracker_id'] = prev_id
+                        event['new_tracker_id'] = int(matched_tracker_ids[match_idx])
+                        debug_events.append(event)
+
+                    if bool(is_frag[match_idx]):
+                        event = dict(base_event)
+                        event['event'] = 'FRAG'
+                        event['fragment_gt_count_before'] = int(gt_frag_count[matched_gt_ids[match_idx]])
+                        debug_events.append(event)
+
             # Update counters for MT/ML/PT/Frag and record for IDSW/Frag for next timestep
             gt_id_count[gt_ids_t] += 1
             gt_matched_count[matched_gt_ids] += 1
@@ -125,6 +249,7 @@ class CLEAR(_BaseMetric):
 
         # Calculate final CLEAR scores
         res = self._compute_final_fields(res)
+        _debug_write_events()
         return res
 
     def combine_sequences(self, all_res):

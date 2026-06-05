@@ -184,14 +184,14 @@ HSM_LTM:
     MIN_DET_SCORE: {0: 0.7}
     MIN_TRACK_LENGTH: {0: 5}
     MIN_SPEED: {0: 0.5}
-    MAX_DISTANCE: {0: 25.0}
-    MAX_DIR_DIFF_DEG: {0: 35.0}
-    MAX_SPEED_REL_DIFF: {0: 0.6}
+    MAX_DISTANCE: {0: 18.0}
+    MAX_DIR_DIFF_DEG: {0: 25.0}
+    MAX_SPEED_REL_DIFF: {0: 0.45}
   # 参考车辆选择方式
   SELECTION:
     MODE: "TOPK_WEIGHTED_RANDOM"   # TOPK / RANDOM / TOPK_WEIGHTED_RANDOM
     TOPK: {0: 5}
-    SAMPLE_NUM: {0: 3}
+    SAMPLE_NUM: {0: 2}
     RANDOM_SEED: 2026
     MIN_REF_NUM: {0: 2}
   # 相似度权重
@@ -218,7 +218,7 @@ HSM_LTM:
 
 # ---------------- group motion switch for exp2 ----------------
 GROUP_MOTION:
-  ENABLE: False
+  ENABLE: True
   # 至少多少条有效轨迹才判断群体运动
   MIN_TRACKS: 3
   # 速度太小的轨迹不参与方向判断，单位近似 m/s
@@ -232,22 +232,20 @@ GROUP_MOTION:
 
 OUTPUT_TRAJ_NMS:
   ENABLE: True
-
   # 使用输出阶段 NMS，只影响最终输出，不删除轨迹
   MODE: "NEIGHBOR_AWARE_NMS"
-
   # 是否使用统一距离策略
   USE_DISTANCE_POLICY: True
   # 距离感知 NMS 阈值
   IOU_THRE_BY_DIST:
     ENABLE: True
-    NEAR: {0: 0.3}
-    MID: {0: 0.5}
+    NEAR: {0: 0.8}
+    MID: {0: 0.7}
     FAR: {0: 0.68}
   # 兜底 IoU 阈值
-  IOU_THRE: 0.30
+  IOU_THRE: 0.40
   # 当前框被邻居覆盖比例
-  COVER_RATIO_THRE: &OVERLAP_RATIO_083 0.83
+  COVER_RATIO_THRE: &OVERLAP_RATIO_083 0.8
   # 邻居框被当前框覆盖比例，处理包含关系
   CONTAIN_RATIO_THRE: *OVERLAP_RATIO_083
   # 如果一个框至少和 2 个邻居重叠，认为可能是局部桥接框
@@ -257,8 +255,21 @@ OUTPUT_TRAJ_NMS:
   # 桥接惩罚，降低它的 NMS 排序分数
   BRIDGE_SCORE_PENALTY: 0.32
 
+ # ---------------- 实验2：生命周期感知保护 ----------------
+  LIFECYCLE_AWARE: True
+
+  # 已经稳定输出过的老轨迹，不允许被 NMS 压掉
+  PROTECT_CONFIRMED_TRACKS: True
+  CONFIRMED_MIN_TRACK_LENGTH: {0: 5}
+  CONFIRMED_MAX_UNMATCH_LENGTH: {0: 0}
+
+  # NMS 只允许压制弱轨迹
+  SUPPRESS_ONLY_WEAK_TRACKS: True
+  SHORT_TRACK_LENGTH: {0: 3}
+  LOW_SCORE_THRE: {0: 0.45}
+
   DEBUG: False
-  PRINT_SUMMARY: False
+  PRINT_SUMMARY: True
 
 OUTPUT_FILTER:
   ENABLE: True
@@ -267,8 +278,8 @@ OUTPUT_FILTER:
   FAR_DIST: *DIST_FAR_START_CAR
   FAR_MIN_OUTPUT_SCORE: {0: 0.30}
 
-  # 如果某个 car 轨迹这一帧没有匹配到检测框，但内部还能预测它的位置，那么最多只允许继续输出 1 帧预测框。
-  MAX_LOST_OUTPUT_LENGTH: {0: 10}
+  # 如果某个 car 轨迹这一帧没有匹配到检测框，但内部还能预测它的位置，那么最多只允许继续输出 10 帧预测框。
+  MAX_LOST_OUTPUT_LENGTH: {0: 3}
 
   SHORT_TRAJ_LENGTH: {0: 10}
   #如果一条轨迹很短，比如长度不超过 3 帧，那么它的平均 score 必须达到 0.60，才更可能被输出。
@@ -277,7 +288,7 @@ OUTPUT_FILTER:
 
 EXP5A_OUT_OF_VIEW:
   ENABLE: True
-  PRINT_SUMMARY: True
+  PRINT_SUMMARY: False
   DEBUG: False
   DEBUG_CANDIDATE: False
   IMAGE_WIDTH: 1242
@@ -290,7 +301,7 @@ EXP5A_OUT_OF_VIEW:
   STATIC_EGO_EXIT:
     ENABLE: True
     DEBUG: False
-    PRINT_SUMMARY: True
+    PRINT_SUMMARY: False
 
     # 核心阈值：裁剪后剩余面积 <= 最大完整框面积的 10%，停止输出
     STOP_REMAIN_RATIO_THRE: {0: 0.01}
