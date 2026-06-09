@@ -350,13 +350,15 @@ RELIABILITY_AWARE_TRACKING:
     ENABLE: True
     # TRS >= HIGH_TRS_THRE：高质量轨迹，只走基础 Kalman unmatched，不进 HSM_LTM。
     HIGH_TRS_THRE: {0: 0.75}
-    # TRS < WEAK_TRS_THRE：弱轨迹，只打 NMS 可压制标签，不进 HSM_LTM。
-    # 0.45 太保守，weak 数量太少；先用 0.55 让 weak-only NMS 有候选。
+    # TRS < WEAK_TRS_THRE：弱轨迹，默认保留 weak 标签；本实验允许 weak 也进入 HSM_LTM。
+    # 0.45 太保守，weak 数量太少；先用 0.55 让 weak + HSM_LTM 有候选。
     WEAK_TRS_THRE: {0: 0.55}
     # matched 阶段所有轨迹都正常 update，不跳过 weak update，避免 FN 暴涨。
     WEAK_UPDATE_MODE: "NORMAL_UPDATE_MARK_WEAK"
     # unmatched 但没有历史 reliability 标签时，默认按中质量处理，避免漏进 MOTION_STATE。
     DEFAULT_UNMATCHED_LEVEL: "medium"
+    # 本实验：high 仍然只走基础 Kalman；weak 不再直接跳过，而是带着 weak 标签进入 HSM_LTM / MOTION_STATE。
+    ALLOW_WEAK_HSM_LTM: True
     PRINT_SUMMARY: False
     DEBUG: False
 
@@ -400,3 +402,37 @@ RELIABILITY_AWARE_TRACKING:
   LOG:
     ENABLE: True
     PRINT_INTERVAL: 200
+TRACK_AWARE_LOW_SCORE_GATE:
+  ENABLE: True
+
+  # 高于这个分数的检测，作为 strong detection 正常进入关联
+  NORMAL_SCORE_THRE: {0: 0.40}
+
+  # 低于这个分数的检测直接丢弃
+  LOW_SCORE_THRE: {0: 0.20}
+
+  # weak detection 只能辅助老轨迹，不能创建新轨迹
+  WEAK_DET_CREATE_NEW_TRACK: False
+
+  # 只有稳定轨迹附近的 weak detection 才保留
+  REQUIRE_NEAR_STABLE_TRACK: True
+
+  # 稳定老轨迹定义
+  MIN_TRACK_LENGTH: {0: 3}
+  MAX_UNMATCHED_AGE: {0: 2}
+
+  # 距离分段
+  DISTANCE_POLICY:
+    NEAR_DIST: {0: 30.0}
+    MID_DIST: {0: 50.0}
+
+  # weak detection 到老轨迹预测位置的最大距离
+  NEAR_TRACK_DIST_THRE:
+    NEAR: {0: 3.0}
+    MID: {0: 5.0}
+    FAR: {0: 7.0}
+
+  # 第二阶段 weak 关联是否更严格
+  SECOND_STAGE_STRICT: True
+
+  DEBUG: False

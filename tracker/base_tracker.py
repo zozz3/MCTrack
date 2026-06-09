@@ -183,6 +183,25 @@ class Base3DTracker:
             "suppressed": 0,
         }
         # ------------------------------------------------------------
+        # EXP5B-v2 Track-aware low-score observation gate.
+        #
+        # 核心边界：
+        # 1) strong detection 正常参与关联，并允许初始化新轨迹；
+        # 2) weak observation 只用于补救稳定老轨迹，不允许初始化新轨迹；
+        # 3) low-score newborn / far-away weak detections 被拒绝，避免制造 ghost tracks。
+        # ------------------------------------------------------------
+        self.track_aware_low_score_gate_stats = {
+            "frames": 0,
+            "checked_dets": 0,
+            "strong": 0,
+            "weak": 0,
+            "rejected_low_score": 0,
+            "rejected_not_near_track": 0,
+            "rejected_no_center": 0,
+            "weak_matched": 0,
+            "weak_unmatched": 0,
+        }
+        # ------------------------------------------------------------
         # EXP7D Reliability-aware selective motion handling.
         # high   : matched 正常 Kalman update；unmatched 只做基础 Kalman fake bbox。
         # medium : matched 正常 update；unmatched 在基础 Kalman 后进入 MOTION_STATE / HSM_LTM。
@@ -199,6 +218,7 @@ class Base3DTracker:
             "unmatched_high_kalman_only": 0,
             "unmatched_medium_motion_state_hsm": 0,
             "unmatched_weak_nms_only": 0,
+            "unmatched_weak_motion_state_hsm": 0,
             "unmatched_unknown_default_medium": 0,
         }
 
@@ -1224,7 +1244,23 @@ class Base3DTracker:
                 "unmatched_high_kalman_only=", self.reliability_router_stats.get("unmatched_high_kalman_only", 0),
                 "unmatched_medium_motion_state_hsm=", self.reliability_router_stats.get("unmatched_medium_motion_state_hsm", 0),
                 "unmatched_weak_nms_only=", self.reliability_router_stats.get("unmatched_weak_nms_only", 0),
+                "unmatched_weak_motion_state_hsm=", self.reliability_router_stats.get("unmatched_weak_motion_state_hsm", 0),
                 "unmatched_unknown_default_medium=", self.reliability_router_stats.get("unmatched_unknown_default_medium", 0),
+            )
+
+        gate_cfg = self._get_track_aware_low_score_gate_cfg()
+        if bool(gate_cfg.get("PRINT_SUMMARY", True)):
+            print(
+                "[TRACK_AWARE_LOW_SCORE_GATE_SUMMARY]",
+                "frames=", self.track_aware_low_score_gate_stats.get("frames", 0),
+                "checked_dets=", self.track_aware_low_score_gate_stats.get("checked_dets", 0),
+                "strong=", self.track_aware_low_score_gate_stats.get("strong", 0),
+                "weak=", self.track_aware_low_score_gate_stats.get("weak", 0),
+                "rejected_low_score=", self.track_aware_low_score_gate_stats.get("rejected_low_score", 0),
+                "rejected_not_near_track=", self.track_aware_low_score_gate_stats.get("rejected_not_near_track", 0),
+                "rejected_no_center=", self.track_aware_low_score_gate_stats.get("rejected_no_center", 0),
+                "weak_matched=", self.track_aware_low_score_gate_stats.get("weak_matched", 0),
+                "weak_unmatched=", self.track_aware_low_score_gate_stats.get("weak_unmatched", 0),
             )
 
         output_traj_nms_cfg = self.cfg.get("OUTPUT_TRAJ_NMS", {})
@@ -1600,7 +1636,8 @@ class Base3DTracker:
         1) 所有轨迹都先执行基础 Kalman unmatched 更新，保证生命周期、fake bbox、unmatch_length 不被破坏。
         2) high 轨迹：基础 Kalman 后直接返回，不进入 HSM_LTM / MOTION_STATE。
         3) medium 轨迹：基础 Kalman 后进入 MOTION_STATE / HSM_LTM。
-        4) weak 轨迹：基础 Kalman 后直接返回，只给输出阶段 weak-only NMS 提供可压制标签。
+        4) weak 轨迹：默认只给输出阶段 weak-only NMS 提供可压制标签；
+           若 ROUTER.ALLOW_WEAK_HSM_LTM=True，则 weak 也带着 weak 标签进入 HSM_LTM。
 
         注意：matched 阶段所有轨迹仍然正常 traj.update()，不会因为 weak 而跳过 update。
         """
@@ -1616,6 +1653,7 @@ class Base3DTracker:
 
         router_enabled = self._reliability_router_enabled()
         router_cfg = self._get_reliability_router_cfg() if router_enabled else {}
+        allow_weak_hsm_ltm = bool(router_cfg.get("ALLOW_WEAK_HSM_LTM", False))
         default_level = str(router_cfg.get("DEFAULT_UNMATCHED_LEVEL", "medium")).lower()
         if default_level not in ["high", "medium", "weak"]:
             default_level = "medium"
@@ -1637,10 +1675,10 @@ class Base3DTracker:
         # ------------------------------------------------------------
         # 必须在 traj.unmatch_update() 前判断静止状态。
         # 因为 unmatch_update() 会追加 Kalman fake bbox，追加后再判断会污染历史位移。
-        # 只有 medium 轨迹需要 MOTION_STATE / HSM_LTM，所以只为 medium 计算。
+        # medium 一定需要 MOTION_STATE / HSM_LTM；weak 只有在 ALLOW_WEAK_HSM_LTM=True 时才需要。
         # ------------------------------------------------------------
         is_static_before_lost = False
-        if route_level == "medium" and motion_state_enable:
+        if (route_level == "medium" or (route_level == "weak" and allow_weak_hsm_ltm)) and motion_state_enable:
             history_window = int(
                 _cfg_by_cls(
                     hsm_cfg.get("HISTORY_WINDOW", {0: 3}),
@@ -1687,17 +1725,30 @@ class Base3DTracker:
                 self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_high_kalman_only")
 
             elif route_level == "weak":
-                self.reliability_router_stats["unmatched_weak_nms_only"] = (
-                    self.reliability_router_stats.get("unmatched_weak_nms_only", 0) + 1
-                )
-                route_meta = {
-                    "level": "weak",
-                    "action": "kalman_unmatched_nms_only",
-                    "motion_state": "none",
-                    "trs": route_trs,
-                    "source": "unmatched_weak_nms_only",
-                }
-                self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_weak_nms_only")
+                if allow_weak_hsm_ltm:
+                    self.reliability_router_stats["unmatched_weak_motion_state_hsm"] = (
+                        self.reliability_router_stats.get("unmatched_weak_motion_state_hsm", 0) + 1
+                    )
+                    route_meta = {
+                        "level": "weak",
+                        "action": "motion_state_hsm_after_kalman_unmatched_weak",
+                        "motion_state": "static" if is_static_before_lost else "moving",
+                        "trs": route_trs,
+                        "source": "unmatched_weak_motion_state_hsm",
+                    }
+                    self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_weak_motion_state_hsm")
+                else:
+                    self.reliability_router_stats["unmatched_weak_nms_only"] = (
+                        self.reliability_router_stats.get("unmatched_weak_nms_only", 0) + 1
+                    )
+                    route_meta = {
+                        "level": "weak",
+                        "action": "kalman_unmatched_nms_only",
+                        "motion_state": "none",
+                        "trs": route_trs,
+                        "source": "unmatched_weak_nms_only",
+                    }
+                    self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_weak_nms_only")
 
             else:
                 self.reliability_router_stats["unmatched_medium_motion_state_hsm"] = (
@@ -1715,8 +1766,8 @@ class Base3DTracker:
         # ------------------------------------------------------------
         # EXP7D 路由分流：
         # high：只信任基础 Kalman 预测，不进入 HSM_LTM / MOTION_STATE。
-        # weak：不使用 HSM_LTM 救轨迹，只把 weak 标签交给最终 NMS。
-        # medium：才继续进入 HSM_LTM / MOTION_STATE。
+        # medium：正常进入 HSM_LTM / MOTION_STATE。
+        # weak：保留 weak 标签；若 ALLOW_WEAK_HSM_LTM=True，则也进入 HSM_LTM / MOTION_STATE。
         # ------------------------------------------------------------
         if router_enabled and route_level == "high":
             if len(traj.bboxes) > 0:
@@ -1724,13 +1775,13 @@ class Base3DTracker:
                 traj.bboxes[-1].hsm_action = "exp7d_high_kalman_only"
             return
 
-        if router_enabled and route_level == "weak":
+        if router_enabled and route_level == "weak" and not allow_weak_hsm_ltm:
             if len(traj.bboxes) > 0:
                 traj.bboxes[-1].hsm_motion_state = "none"
                 traj.bboxes[-1].hsm_action = "exp7d_weak_nms_only"
             return
 
-        # 关闭 HSM 时，medium 也只保留基础 Kalman unmatched。
+        # 关闭 HSM 时，medium / weak 都只保留基础 Kalman unmatched。
         if not hsm_enable:
             return
 
@@ -1746,20 +1797,20 @@ class Base3DTracker:
             return
 
         # ------------------------------------------------------------
-        # 只有 medium 轨迹进入这里。
-        # 静止 medium：不进群体运动，用静止自车参考框 / Kalman-only 检查。
-        # 运动 medium：沿用原 HSM_LTM 审查 / 修正逻辑。
+        # medium 轨迹一定进入这里；weak 在 ALLOW_WEAK_HSM_LTM=True 时也进入这里。
+        # 静止轨迹：不进群体运动，用静止自车参考框 / Kalman-only 检查。
+        # 运动轨迹：沿用原 HSM_LTM 审查 / 修正逻辑。
         # ------------------------------------------------------------
         if motion_state_enable and is_static_before_lost:
             ego_preserved = self._apply_static_ego_exit_exp5a(
                 traj,
                 frame_info=frame_info,
-                source="unmatched_medium_static_ego",
+                source="unmatched_weak_static_ego" if route_level == "weak" else "unmatched_medium_static_ego",
             )
 
             if motion_cfg.get("DEBUG", False):
                 print(
-                    "[HSM_LTM][MOTION_STATE][EXP7D_MEDIUM]",
+                    "[HSM_LTM][MOTION_STATE][EXP7D_WEAK]" if route_level == "weak" else "[HSM_LTM][MOTION_STATE][EXP7D_MEDIUM]",
                     "track_id=", track_id,
                     "frame=", frame_id,
                     "state=static",
@@ -1777,11 +1828,11 @@ class Base3DTracker:
         if motion_state_enable:
             if len(traj.bboxes) > 0:
                 traj.bboxes[-1].hsm_motion_state = "moving"
-                traj.bboxes[-1].hsm_action = "original_hsm_ltm_medium_only"
+                traj.bboxes[-1].hsm_action = "original_hsm_ltm_weak_enabled" if route_level == "weak" else "original_hsm_ltm_medium_only"
 
             if motion_cfg.get("DEBUG", False):
                 print(
-                    "[HSM_LTM][MOTION_STATE][EXP7D_MEDIUM]",
+                    "[HSM_LTM][MOTION_STATE][EXP7D_WEAK]" if route_level == "weak" else "[HSM_LTM][MOTION_STATE][EXP7D_MEDIUM]",
                     "track_id=", track_id,
                     "frame=", frame_id,
                     "state=moving",
@@ -1807,33 +1858,399 @@ class Base3DTracker:
         for track_id, traj in self.all_trajs.items():
             traj.predict()
 
+
+    # ------------------------------------------------------------
+    # EXP5B-v2 Track-aware low-score observation gate
+    # ------------------------------------------------------------
+    def _get_track_aware_low_score_gate_cfg(self):
+        cfg = self.cfg.get("TRACK_AWARE_LOW_SCORE_GATE", {})
+        if not isinstance(cfg, dict):
+            return {}
+        return cfg
+
+    def _track_aware_low_score_gate_enabled(self):
+        cfg = self._get_track_aware_low_score_gate_cfg()
+        return bool(cfg.get("ENABLE", False))
+
+    def _get_bbox_cls_id_track_aware_gate(self, bbox):
+        """
+        尽量读取检测框类别。KITTI car 默认为 0。
+        """
+        category_map = self.cfg.get("CATEGORY_MAP_TO_NUMBER", {})
+
+        for name in ["category", "category_name", "det_name", "name"]:
+            if hasattr(bbox, name):
+                cate = getattr(bbox, name)
+                if cate in category_map:
+                    try:
+                        return int(category_map[cate])
+                    except Exception:
+                        pass
+
+        for name in ["category_num", "category_id", "label", "cls_id"]:
+            if hasattr(bbox, name):
+                try:
+                    return int(getattr(bbox, name))
+                except Exception:
+                    pass
+
+        return 0
+
+    def _get_bbox_center_xy_track_aware_gate(self, bbox):
+        """
+        读取 bbox 的 BEV 中心。
+        这里优先使用 fusion/predict/global 字段，兼容 MCTrack 的 BBox 结构。
+        """
+        return self._get_bbox_center_xy_exp7(bbox)
+
+    def _get_track_center_xy_track_aware_gate(self, traj):
+        """
+        读取轨迹当前预测中心。
+        predict_before_associate() 已经在当前帧开头执行，
+        所以 traj.bboxes[-1] 通常就是当前帧用于关联的预测状态。
+        """
+        if traj is None or not hasattr(traj, "bboxes") or len(traj.bboxes) == 0:
+            return None
+        return self._get_bbox_center_xy_track_aware_gate(traj.bboxes[-1])
+
+    def _get_distance_level_track_aware_gate(self, dist, cls_id=0):
+        cfg = self._get_track_aware_low_score_gate_cfg()
+        dist_cfg = cfg.get("DISTANCE_POLICY", {})
+        if not isinstance(dist_cfg, dict):
+            dist_cfg = {}
+
+        near = float(_cfg_by_cls(dist_cfg.get("NEAR_DIST", {0: 30.0}), cls_id, 30.0))
+        mid = float(_cfg_by_cls(dist_cfg.get("MID_DIST", {0: 50.0}), cls_id, 50.0))
+
+        if dist < near:
+            return "NEAR"
+        if dist < mid:
+            return "MID"
+        return "FAR"
+
+    def _get_track_aware_gate_dist_thre(self, det_dist, cls_id=0):
+        cfg = self._get_track_aware_low_score_gate_cfg()
+        dist_thre_cfg = cfg.get("NEAR_TRACK_DIST_THRE", {})
+        if not isinstance(dist_thre_cfg, dict):
+            dist_thre_cfg = {}
+
+        level = self._get_distance_level_track_aware_gate(det_dist, cls_id)
+        if level == "NEAR":
+            return float(_cfg_by_cls(dist_thre_cfg.get("NEAR", {0: 3.0}), cls_id, 3.0))
+        if level == "MID":
+            return float(_cfg_by_cls(dist_thre_cfg.get("MID", {0: 5.0}), cls_id, 5.0))
+        return float(_cfg_by_cls(dist_thre_cfg.get("FAR", {0: 7.0}), cls_id, 7.0))
+
+    def _is_stable_track_for_low_score_gate(self, traj, cls_id=None):
+        """
+        weak observation 只能服务稳定老轨迹。
+        默认不要求已经输出过，因为有些真实轨迹在确认前也可能需要低分补救；
+        若想更保守，可在 yaml 中设置 REQUIRE_ALREADY_OUTPUT: True。
+        """
+        if traj is None:
+            return False
+
+        if int(getattr(traj, "status_flag", 1)) == 4:
+            return False
+
+        gate_cfg = self._get_track_aware_low_score_gate_cfg()
+        track_cls = getattr(traj, "category_num", _get_traj_cls_id(traj, self.cfg))
+        if cls_id is not None and int(track_cls) != int(cls_id):
+            return False
+
+        min_track_length = int(
+            _cfg_by_cls(
+                gate_cfg.get("MIN_TRACK_LENGTH", {0: 3}),
+                int(track_cls),
+                3,
+            )
+        )
+        max_unmatched_age = int(
+            _cfg_by_cls(
+                gate_cfg.get("MAX_UNMATCHED_AGE", {0: 2}),
+                int(track_cls),
+                2,
+            )
+        )
+
+        track_length = self._get_track_length_exp7(traj)
+        unmatch_length = self._get_unmatch_length_exp7(traj)
+
+        if track_length < min_track_length:
+            return False
+
+        if unmatch_length > max_unmatched_age:
+            return False
+
+        if bool(gate_cfg.get("REQUIRE_ALREADY_OUTPUT", False)) and not bool(getattr(traj, "is_output", False)):
+            return False
+
+        if self._get_track_center_xy_track_aware_gate(traj) is None:
+            return False
+
+        return True
+
+    def _is_det_near_stable_track_for_low_score_gate(self, det_bbox, trajs, cls_id=0):
+        det_center = self._get_bbox_center_xy_track_aware_gate(det_bbox)
+        if det_center is None:
+            self.track_aware_low_score_gate_stats["rejected_no_center"] = (
+                self.track_aware_low_score_gate_stats.get("rejected_no_center", 0) + 1
+            )
+            return False
+
+        det_dist = _get_bbox_dist(det_bbox)
+        dist_gate = self._get_track_aware_gate_dist_thre(det_dist, cls_id)
+
+        for traj in trajs:
+            if not self._is_stable_track_for_low_score_gate(traj, cls_id=cls_id):
+                continue
+
+            track_center = self._get_track_center_xy_track_aware_gate(traj)
+            if track_center is None:
+                continue
+
+            residual = float(np.linalg.norm(np.asarray(det_center, dtype=float) - np.asarray(track_center, dtype=float)))
+            if residual <= dist_gate:
+                try:
+                    det_bbox.track_aware_near_track_id = int(traj.track_id)
+                    det_bbox.track_aware_near_track_residual = float(residual)
+                    det_bbox.track_aware_dist_gate = float(dist_gate)
+                except Exception:
+                    pass
+                return True
+
+        return False
+
+    def _split_dets_by_track_aware_low_score_gate(self, det_bboxes, trajs, frame_info=None):
+        """
+        将检测分成三类：
+        1) strong_bboxes：正常参与 BEV/RV 关联，并允许初始化新轨迹；
+        2) weak_bboxes：低分但靠近稳定老轨迹，只允许二阶段补救关联，不允许初始化新轨迹；
+        3) rejected_bboxes：极低分或低分且远离稳定老轨迹，不参与关联，不初始化新轨迹。
+        """
+        gate_cfg = self._get_track_aware_low_score_gate_cfg()
+        if not self._track_aware_low_score_gate_enabled():
+            return list(det_bboxes), [], []
+
+        self.track_aware_low_score_gate_stats["frames"] = (
+            self.track_aware_low_score_gate_stats.get("frames", 0) + 1
+        )
+
+        strong_bboxes = []
+        weak_bboxes = []
+        rejected_bboxes = []
+
+        traj_list = list(trajs) if trajs is not None else []
+
+        for det_bbox in list(det_bboxes):
+            self.track_aware_low_score_gate_stats["checked_dets"] = (
+                self.track_aware_low_score_gate_stats.get("checked_dets", 0) + 1
+            )
+
+            cls_id = self._get_bbox_cls_id_track_aware_gate(det_bbox)
+            normal_score_thre = float(
+                _cfg_by_cls(
+                    gate_cfg.get("NORMAL_SCORE_THRE", {0: 0.40}),
+                    cls_id,
+                    0.40,
+                )
+            )
+            low_score_thre = float(
+                _cfg_by_cls(
+                    gate_cfg.get("LOW_SCORE_THRE", {0: 0.20}),
+                    cls_id,
+                    0.20,
+                )
+            )
+
+            score = float(_get_bbox_score(det_bbox))
+
+            if score >= normal_score_thre:
+                try:
+                    det_bbox.track_aware_obs_level = "strong"
+                    det_bbox.track_aware_can_init = True
+                except Exception:
+                    pass
+                strong_bboxes.append(det_bbox)
+                self.track_aware_low_score_gate_stats["strong"] = (
+                    self.track_aware_low_score_gate_stats.get("strong", 0) + 1
+                )
+                continue
+
+            if score < low_score_thre:
+                try:
+                    det_bbox.track_aware_obs_level = "rejected_low_score"
+                    det_bbox.track_aware_can_init = False
+                except Exception:
+                    pass
+                rejected_bboxes.append(det_bbox)
+                self.track_aware_low_score_gate_stats["rejected_low_score"] = (
+                    self.track_aware_low_score_gate_stats.get("rejected_low_score", 0) + 1
+                )
+                continue
+
+            if self._is_det_near_stable_track_for_low_score_gate(det_bbox, traj_list, cls_id=cls_id):
+                try:
+                    det_bbox.track_aware_obs_level = "weak"
+                    det_bbox.track_aware_can_init = False
+                except Exception:
+                    pass
+                weak_bboxes.append(det_bbox)
+                self.track_aware_low_score_gate_stats["weak"] = (
+                    self.track_aware_low_score_gate_stats.get("weak", 0) + 1
+                )
+            else:
+                try:
+                    det_bbox.track_aware_obs_level = "rejected_not_near_track"
+                    det_bbox.track_aware_can_init = False
+                except Exception:
+                    pass
+                rejected_bboxes.append(det_bbox)
+                self.track_aware_low_score_gate_stats["rejected_not_near_track"] = (
+                    self.track_aware_low_score_gate_stats.get("rejected_not_near_track", 0) + 1
+                )
+
+        if bool(gate_cfg.get("DEBUG", False)):
+            print(
+                "[TRACK_AWARE_LOW_SCORE_GATE]",
+                "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                "strong=", len(strong_bboxes),
+                "weak=", len(weak_bboxes),
+                "rejected=", len(rejected_bboxes),
+            )
+
+        return strong_bboxes, weak_bboxes, rejected_bboxes
+
+    def _associate_weak_observations_track_aware_gate(
+        self,
+        unmatched_trajs,
+        weak_bboxes,
+        frame_info=None,
+        use_group_motion=False,
+    ):
+        """
+        第二阶段 weak observation 补救关联。
+        只允许 unmatched stable tracks 参与，不创建新轨迹。
+        """
+        if not self._track_aware_low_score_gate_enabled():
+            return unmatched_trajs
+
+        if len(unmatched_trajs) == 0 or len(weak_bboxes) == 0:
+            self.track_aware_low_score_gate_stats["weak_unmatched"] = (
+                self.track_aware_low_score_gate_stats.get("weak_unmatched", 0) + len(weak_bboxes)
+            )
+            return unmatched_trajs
+
+        candidate_trajs = []
+        for traj in self.get_trajectory_bbox(unmatched_trajs):
+            cls_id = getattr(traj, "category_num", _get_traj_cls_id(traj, self.cfg))
+            if self._is_stable_track_for_low_score_gate(traj, cls_id=cls_id):
+                candidate_trajs.append(traj)
+
+        if len(candidate_trajs) == 0:
+            self.track_aware_low_score_gate_stats["weak_unmatched"] = (
+                self.track_aware_low_score_gate_stats.get("weak_unmatched", 0) + len(weak_bboxes)
+            )
+            return unmatched_trajs
+
+        match_res_weak, cost_matrix_weak = match_trajs_and_dets(
+            candidate_trajs,
+            weak_bboxes,
+            self.cfg,
+            use_group_motion=use_group_motion,
+        )
+        match_res_weak = np.asarray(match_res_weak, dtype=int).reshape(-1, 2)
+
+        matched_track_ids = set()
+        matched_weak_det_indices = set()
+
+        for i in range(len(candidate_trajs)):
+            track_id = candidate_trajs[i].track_id
+            if match_res_weak.shape[0] > 0 and i in match_res_weak[:, 0]:
+                indexes = np.where(match_res_weak[:, 0] == i)[0]
+                det_index = int(match_res_weak[indexes, 1][0])
+                det_bbox = weak_bboxes[det_index]
+
+                # 二阶段 weak 关联再做一次轻量安全检查，避免 weak 框跨距离误接。
+                cls_id = getattr(candidate_trajs[i], "category_num", _get_traj_cls_id(candidate_trajs[i], self.cfg))
+                det_center = self._get_bbox_center_xy_track_aware_gate(det_bbox)
+                track_center = self._get_track_center_xy_track_aware_gate(candidate_trajs[i])
+                det_dist = _get_bbox_dist(det_bbox)
+                dist_gate = self._get_track_aware_gate_dist_thre(det_dist, cls_id)
+                residual = 999.0
+                if det_center is not None and track_center is not None:
+                    residual = float(np.linalg.norm(np.asarray(det_center, dtype=float) - np.asarray(track_center, dtype=float)))
+
+                if bool(self._get_track_aware_low_score_gate_cfg().get("SECOND_STAGE_STRICT", True)):
+                    if residual > dist_gate:
+                        continue
+
+                try:
+                    det_bbox.track_aware_obs_level = "weak_matched"
+                    det_bbox.track_aware_can_init = False
+                    det_bbox.track_aware_second_stage_residual = float(residual)
+                except Exception:
+                    pass
+
+                self._update_matched_with_reliability_router(
+                    track_id=track_id,
+                    det_bbox=det_bbox,
+                    cost_value=cost_matrix_weak[indexes][0],
+                    frame_info=frame_info,
+                    source="matched_weak_low_score",
+                )
+                self.all_trajs[track_id].exp5a_static_ego_finished = False
+                self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
+
+                exp5a_deleted = self._apply_out_of_view_termination_exp5a(
+                    self.all_trajs[track_id],
+                    frame_info,
+                    source="matched_weak_low_score",
+                )
+                if not exp5a_deleted:
+                    self._update_full_vehicle_reference_exp5a(
+                        self.all_trajs[track_id],
+                        frame_info,
+                        source="matched_weak_low_score",
+                    )
+
+                matched_track_ids.add(track_id)
+                matched_weak_det_indices.add(det_index)
+                self.track_aware_low_score_gate_stats["weak_matched"] = (
+                    self.track_aware_low_score_gate_stats.get("weak_matched", 0) + 1
+                )
+
+        self.track_aware_low_score_gate_stats["weak_unmatched"] = (
+            self.track_aware_low_score_gate_stats.get("weak_unmatched", 0)
+            + max(0, len(weak_bboxes) - len(matched_weak_det_indices))
+        )
+
+        final_unmatched_trajs = {}
+        for track_id, traj in unmatched_trajs.items():
+            if track_id not in matched_track_ids:
+                final_unmatched_trajs[track_id] = traj
+
+        return final_unmatched_trajs
+
+
     def track_single_frame(self, frame_info):
         """
         Info: This function tracks objects in a single frame, performing association between predicted trajectories and detected objects.
-        Parameters:
-            input:
-                frame_info: Object containing information about the current frame.
-            output:
-                output_trajs: Updated trajectories after performing tracking and matching for the current frame.
+
+        EXP5B-v2 clean path:
+        1) 旧的全图异常框、新生遮挡抑制、输出 NMS 等逻辑仍保留，但只在 yaml ENABLE=True 时生效；
+        2) 新增 Track-aware low-score observation gate；
+        3) strong detections 负责正常关联和新轨迹出生；
+        4) weak observations 只用于 unmatched stable tracks 的二阶段补救关联，不允许创建新轨迹。
         """
         self.predict_before_associate()
 
         # ------------------------------------------------------------
-        # 实验五E-1：全图异常检测框软屏蔽
-        # ------------------------------------------------------------
-        # 原始 VirConv 检测文件不做任何修改。
-        # 这里只在 tracker 当前帧内部屏蔽异常框，使其不参与：
-        # 1) BEV/RV 数据关联；
-        # 2) 已有轨迹 update；
-        # 3) 新生轨迹初始化；
-        # 4) 最终输出。
-        #
-        # 屏蔽条件：
-        # - bbox 几乎覆盖整张图像；
-        # - 或 bbox 至少三条边贴近图像边界。
+        # 旧逻辑清理：全图异常检测框软屏蔽默认不再自动开启。
+        # 只有 yaml 显式 FULL_IMAGE_BBOX_SOFT_IGNORE.ENABLE=True 时才执行。
         # ------------------------------------------------------------
         full_image_cfg = self.cfg.get("FULL_IMAGE_BBOX_SOFT_IGNORE", {})
-        if bool(full_image_cfg.get("ENABLE", True)):
+        if bool(full_image_cfg.get("ENABLE", False)):
             image_w, image_h = self._get_image_shape_exp5a(
                 bbox=None,
                 frame_info=frame_info,
@@ -1861,12 +2278,27 @@ class Base3DTracker:
                 + len(ignored_full_image_bboxes)
             )
 
-            # 软屏蔽：只改当前 tracker 运行时使用的 detection 列表。
-            # 不改 base_version json，不改原始 VirConv 文件。
             frame_info.bboxes = valid_bboxes
 
+        # 当前帧预测后的轨迹。
         trajs = self.get_trajectory_bbox(self.all_trajs)
-        trajs_cnt, dets_cnt = len(trajs), len(frame_info.bboxes)
+
+        # ------------------------------------------------------------
+        # EXP5B-v2：轨迹感知低分观测门控
+        # ------------------------------------------------------------
+        # strong_bboxes：正常进入第一阶段 BEV/RV 关联，允许创建新轨迹。
+        # weak_bboxes：只允许在 strong 关联结束后，补救 unmatched stable tracks。
+        # rejected_bboxes：不参与关联，不创建新轨迹。
+        # ------------------------------------------------------------
+        strong_bboxes, weak_bboxes, rejected_bboxes = self._split_dets_by_track_aware_low_score_gate(
+            det_bboxes=frame_info.bboxes,
+            trajs=trajs,
+            frame_info=frame_info,
+        )
+
+        trajs_cnt = len(trajs)
+        dets_cnt = len(strong_bboxes)
+
         use_group_motion, group_info = detect_group_motion(trajs, self.cfg)
 
         if self.cfg.get("GROUP_MOTION", {}).get("DEBUG", False):
@@ -1881,14 +2313,19 @@ class Base3DTracker:
                 "avg_speed=", round(group_info.get("avg_speed", 0.0), 3),
             )
 
+        # ------------------------------------------------------------
+        # 第一阶段：只用 strong detections 做原始 BEV 关联。
+        # weak detections 不参与这一阶段，避免低分框污染正常关联。
+        # ------------------------------------------------------------
         match_res, cost_matrix = match_trajs_and_dets(
             trajs,
-            frame_info.bboxes,
+            strong_bboxes,
             self.cfg,
-            use_group_motion=use_group_motion
+            use_group_motion=use_group_motion,
         )
-        matched_det_indices = set(match_res[:, 1])
+        match_res = np.asarray(match_res, dtype=int).reshape(-1, 2)
 
+        matched_det_indices = set(match_res[:, 1].tolist()) if match_res.shape[0] > 0 else set()
         unmatched_det_indices = np.array(
             [i for i in range(dets_cnt) if i not in matched_det_indices]
         )
@@ -1896,41 +2333,47 @@ class Base3DTracker:
         unmatched_trajs = {}
         for i in range(trajs_cnt):
             track_id = trajs[i].track_id
-            if i in match_res[:, 0]:
+            if match_res.shape[0] > 0 and i in match_res[:, 0]:
                 indexes = np.where(match_res[:, 0] == i)[0]
+                det_idx = int(match_res[indexes, 1][0])
                 self._update_matched_with_reliability_router(
                     track_id=track_id,
-                    det_bbox=frame_info.bboxes[match_res[indexes, 1][0]],
+                    det_bbox=strong_bboxes[det_idx],
                     cost_value=cost_matrix[indexes][0],
                     frame_info=frame_info,
-                    source="matched_bev",
+                    source="matched_bev_strong",
                 )
                 self.all_trajs[track_id].exp5a_static_ego_finished = False
                 self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
-                # 实验五A v6：先用历史完整面积判断当前框是否已经只剩车尾/车屁股。
-                # 如果没有删除，再把当前非贴边大框更新为新的完整参考面积。
+
                 exp5a_deleted = self._apply_out_of_view_termination_exp5a(
-                    self.all_trajs[track_id], frame_info, source="matched_bev"
+                    self.all_trajs[track_id], frame_info, source="matched_bev_strong"
                 )
                 if not exp5a_deleted:
                     self._update_full_vehicle_reference_exp5a(
-                        self.all_trajs[track_id], frame_info, source="matched_bev"
+                        self.all_trajs[track_id], frame_info, source="matched_bev_strong"
                     )
             else:
                 unmatched_trajs[track_id] = self.all_trajs[track_id]
-                if not self.cfg["IS_RV_MATCHING"]:
-                    self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
 
-        init_bboxes = frame_info.bboxes
+        # 默认情况下，新生候选只来自 unmatched strong detections。
+        init_bboxes = strong_bboxes
+        init_det_indices = unmatched_det_indices
+        unmatched_trajs_after_strong = unmatched_trajs
+
+        # ------------------------------------------------------------
+        # RV 二次匹配仍然只使用 unmatched strong detections。
+        # weak detections 留给后面的 track-aware second stage。
+        # ------------------------------------------------------------
         if self.cfg["IS_RV_MATCHING"]:
             unmatched_trajs_inbev = self.get_trajectory_bbox(unmatched_trajs)
-            trajs_cnt_inbev, dets_cnt_inbev = len(unmatched_trajs_inbev), len(
-                unmatched_det_indices
-            )
+            trajs_cnt_inbev = len(unmatched_trajs_inbev)
+            dets_cnt_inbev = len(unmatched_det_indices)
+
             unmatched_dets_inbev = (
-                np.array(frame_info.bboxes)[unmatched_det_indices].tolist()
+                np.array(strong_bboxes, dtype=object)[unmatched_det_indices].tolist()
                 if dets_cnt_inbev > 0
-                else unmatched_det_indices
+                else []
             )
 
             match_res_inbev, cost_matrix_inbev = match_trajs_and_dets(
@@ -1940,15 +2383,18 @@ class Base3DTracker:
                 frame_info.transform_matrix,
                 is_rv=True,
             )
+            match_res_inbev = np.asarray(match_res_inbev, dtype=int).reshape(-1, 2)
+
+            rv_matched_track_ids = set()
 
             for i in range(trajs_cnt_inbev):
                 track_id = unmatched_trajs_inbev[i].track_id
-                if i in match_res_inbev[:, 0]:
+                if match_res_inbev.shape[0] > 0 and i in match_res_inbev[:, 0]:
                     indexes = np.where(match_res_inbev[:, 0] == i)[0]
+                    det_index = int(match_res_inbev[indexes, 1][0])
                     trk_bbox = self.all_trajs[track_id].bboxes[-1]
-                    det_bbox = unmatched_dets_inbev[
-                        match_res_inbev[match_res_inbev[:, 0] == i, 1][0]
-                    ]
+                    det_bbox = unmatched_dets_inbev[det_index]
+
                     diff_rot = (
                         abs(
                             norm_realative_radian(
@@ -1962,48 +2408,65 @@ class Base3DTracker:
                         np.array(trk_bbox.global_xyz) - np.array(det_bbox.global_xyz)
                     )
                     if diff_rot > 90 or dist > 5:
-                        self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
                         continue
+
                     self._update_matched_with_reliability_router(
                         track_id=track_id,
                         det_bbox=det_bbox,
                         cost_value=float(cost_matrix_inbev[indexes]),
                         frame_info=frame_info,
-                        source="matched_rv",
+                        source="matched_rv_strong",
                     )
                     self.all_trajs[track_id].exp5a_static_ego_finished = False
                     self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
-                    # 实验五A v6：RV 二次匹配后也先检查真实出界，再更新参考面积。
+
                     exp5a_deleted = self._apply_out_of_view_termination_exp5a(
-                        self.all_trajs[track_id], frame_info, source="matched_rv"
+                        self.all_trajs[track_id], frame_info, source="matched_rv_strong"
                     )
                     if not exp5a_deleted:
                         self._update_full_vehicle_reference_exp5a(
-                            self.all_trajs[track_id], frame_info, source="matched_rv"
+                            self.all_trajs[track_id], frame_info, source="matched_rv_strong"
                         )
-                else:
-                    self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
 
-            matched_det_indices = set(match_res_inbev[:, 1])
-            unmatched_det_indices = np.array(
-                [i for i in range(dets_cnt_inbev) if i not in matched_det_indices]
+                    rv_matched_track_ids.add(track_id)
+
+            matched_det_indices_rv = set(match_res_inbev[:, 1].tolist()) if match_res_inbev.shape[0] > 0 else set()
+            init_det_indices = np.array(
+                [i for i in range(dets_cnt_inbev) if i not in matched_det_indices_rv]
             )
             init_bboxes = unmatched_dets_inbev
 
-        newborn_occ_cfg = self.cfg.get("NEWBORN_OCCLUSION_SUPPRESS", {})
-        newborn_occ_enable = bool(newborn_occ_cfg.get("ENABLE", True))
+            unmatched_trajs_after_strong = {}
+            for track_id, traj in unmatched_trajs.items():
+                if track_id not in rv_matched_track_ids:
+                    unmatched_trajs_after_strong[track_id] = traj
 
-        for i in unmatched_det_indices:
+        # ------------------------------------------------------------
+        # 第二阶段：weak observations 只补救 unmatched stable tracks。
+        # 不允许 weak observations 创建新轨迹。
+        # ------------------------------------------------------------
+        unmatched_trajs_after_weak = self._associate_weak_observations_track_aware_gate(
+            unmatched_trajs=unmatched_trajs_after_strong,
+            weak_bboxes=weak_bboxes,
+            frame_info=frame_info,
+            use_group_motion=use_group_motion,
+        )
+
+        # 所有 strong/RV/weak 都没有匹配到的轨迹，最后才执行 unmatched update。
+        for track_id in list(unmatched_trajs_after_weak.keys()):
+            self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
+
+        # ------------------------------------------------------------
+        # 新生轨迹初始化：只允许 unmatched strong detections。
+        # weak_bboxes 和 rejected_bboxes 都不会走到这里。
+        # ------------------------------------------------------------
+        newborn_occ_cfg = self.cfg.get("NEWBORN_OCCLUSION_SUPPRESS", {})
+        # 旧逻辑清理：新生遮挡抑制默认不再自动开启。
+        newborn_occ_enable = bool(newborn_occ_cfg.get("ENABLE", False))
+
+        for i in init_det_indices:
             det_bbox = init_bboxes[int(i)]
 
-            # ------------------------------------------------------------
-            # 实验五E-2：新生高遮挡检测抑制
-            # ------------------------------------------------------------
-            # 只作用于 unmatched detection 初始化新轨迹之前。
-            # 不影响已有轨迹的匹配、更新和遮挡保持。
-            # 如果当前检测框的大部分 2D 区域被同一帧中置信度相近或更高的检测框覆盖，
-            # 则认为该检测在当前帧可见性不足或存在重复响应风险，暂不初始化新轨迹。
-            # ------------------------------------------------------------
             if newborn_occ_enable:
                 self.newborn_occlusion_suppress_stats["checked"] = (
                     self.newborn_occlusion_suppress_stats.get("checked", 0) + 1
@@ -2035,9 +2498,8 @@ class Base3DTracker:
                 init_bbox=det_bbox,
                 cfg=self.cfg,
             )
-            # 实验五A v6：新生轨迹如果完整可见，先记录完整车辆面积。
             self._update_full_vehicle_reference_exp5a(
-                self.all_trajs[self.track_id_counter], frame_info, source="new_track"
+                self.all_trajs[self.track_id_counter], frame_info, source="new_track_strong"
             )
             self.track_id_counter += 1
 
@@ -2049,11 +2511,7 @@ class Base3DTracker:
         output_trajs = self.get_output_trajs(frame_info.frame_id)
 
         # ------------------------------------------------------------
-        # 实验五E-4：输出阶段轨迹级 NMS
-        # ------------------------------------------------------------
-        # 这是 KITTI 路径真正生效的输出阶段 NMS。
-        # 它只处理当前帧 output_trajs 之间的邻居重叠，不删除轨迹，
-        # 不影响匹配，不影响 Kalman，只是不输出当前帧被 NMS 抑制的框。
+        # 输出阶段轨迹级 NMS 仍然只在 yaml ENABLE=True 时生效。
         # ------------------------------------------------------------
         output_traj_nms_cfg = self.cfg.get("OUTPUT_TRAJ_NMS", {})
         if not isinstance(output_traj_nms_cfg, dict) or len(output_traj_nms_cfg) == 0:
@@ -2076,6 +2534,7 @@ class Base3DTracker:
             )
 
         return output_trajs
+
 
     def get_output_trajs(self, frame_id):
         output_trajs = {}
