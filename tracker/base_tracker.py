@@ -182,6 +182,25 @@ class Base3DTracker:
             "checked_frames": 0,
             "suppressed": 0,
         }
+        # ------------------------------------------------------------
+        # EXP7D Reliability-aware selective motion handling.
+        # high   : matched 正常 Kalman update；unmatched 只做基础 Kalman fake bbox。
+        # medium : matched 正常 update；unmatched 在基础 Kalman 后进入 MOTION_STATE / HSM_LTM。
+        # weak   : matched / unmatched 都不破坏基础生命周期，只在输出 NMS 阶段允许被压制。
+        # ------------------------------------------------------------
+        self.reliability_router_stats = {
+            "matched_checked": 0,
+            "high_kalman": 0,
+            "medium_motion_state": 0,
+            "medium_static": 0,
+            "medium_moving": 0,
+            "weak_nms_suppress": 0,
+            "weak_skip_update": 0,
+            "unmatched_high_kalman_only": 0,
+            "unmatched_medium_motion_state_hsm": 0,
+            "unmatched_weak_nms_only": 0,
+            "unmatched_unknown_default_medium": 0,
+        }
 
     def _get_exp5a_cfg(self):
         return self.cfg.get("EXP5A_OUT_OF_VIEW", {})
@@ -1189,6 +1208,25 @@ class Base3DTracker:
                 "suppressed=", self.newborn_occlusion_suppress_stats.get("suppressed", 0),
             )
 
+        rat_cfg = self._get_reliability_tracking_cfg()
+        router_cfg = self._get_reliability_router_cfg()
+        log_cfg = rat_cfg.get("LOG", {}) if isinstance(rat_cfg, dict) else {}
+        if bool(router_cfg.get("PRINT_SUMMARY", log_cfg.get("PRINT_SUMMARY", True))):
+            print(
+                "[RELIABILITY_ROUTER_SUMMARY]",
+                "matched_checked=", self.reliability_router_stats.get("matched_checked", 0),
+                "high_kalman=", self.reliability_router_stats.get("high_kalman", 0),
+                "medium_motion_state=", self.reliability_router_stats.get("medium_motion_state", 0),
+                "medium_static=", self.reliability_router_stats.get("medium_static", 0),
+                "medium_moving=", self.reliability_router_stats.get("medium_moving", 0),
+                "weak_nms_suppress=", self.reliability_router_stats.get("weak_nms_suppress", 0),
+                "weak_skip_update=", self.reliability_router_stats.get("weak_skip_update", 0),
+                "unmatched_high_kalman_only=", self.reliability_router_stats.get("unmatched_high_kalman_only", 0),
+                "unmatched_medium_motion_state_hsm=", self.reliability_router_stats.get("unmatched_medium_motion_state_hsm", 0),
+                "unmatched_weak_nms_only=", self.reliability_router_stats.get("unmatched_weak_nms_only", 0),
+                "unmatched_unknown_default_medium=", self.reliability_router_stats.get("unmatched_unknown_default_medium", 0),
+            )
+
         output_traj_nms_cfg = self.cfg.get("OUTPUT_TRAJ_NMS", {})
         if not isinstance(output_traj_nms_cfg, dict) or len(output_traj_nms_cfg) == 0:
             output_traj_nms_cfg = self.cfg.get("THRESHOLD", {}).get("OUTPUT_TRAJ_NMS", {})
@@ -1199,7 +1237,373 @@ class Base3DTracker:
                 "suppressed=", self.output_traj_nms_stats.get("suppressed", 0),
             )
 
+    def _get_reliability_tracking_cfg(self):
+        cfg = self.cfg.get("RELIABILITY_AWARE_TRACKING", {})
+        if not isinstance(cfg, dict):
+            return {}
+        return cfg
+
+    def _get_reliability_router_cfg(self):
+        cfg = self._get_reliability_tracking_cfg()
+        router_cfg = cfg.get("ROUTER", {})
+        if not isinstance(router_cfg, dict):
+            router_cfg = {}
+        return router_cfg
+
+    def _reliability_router_enabled(self):
+        cfg = self._get_reliability_tracking_cfg()
+        router_cfg = self._get_reliability_router_cfg()
+        return bool(cfg.get("ENABLE", False)) and bool(router_cfg.get("ENABLE", False))
+
+    def _safe_float_exp7(self, value, default=0.0):
+        try:
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if arr.shape[0] == 0:
+                return float(default)
+            if not np.isfinite(arr[0]):
+                return float(default)
+            return float(arr[0])
+        except Exception:
+            return float(default)
+
+    def _get_bbox_center_xy_exp7(self, bbox):
+        if bbox is None:
+            return None
+        for name in [
+            "global_xyz_lwh_yaw_fusion",
+            "global_xyz_lwh_yaw_predict",
+            "global_xyz_lwh_yaw",
+            "global_xyz",
+            "xyz",
+        ]:
+            if not hasattr(bbox, name):
+                continue
+            value = getattr(bbox, name)
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value, dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if arr.shape[0] >= 2 and np.all(np.isfinite(arr[:2])):
+                return arr[:2].astype(float)
+        return None
+
+    def _get_track_length_exp7(self, traj):
+        try:
+            return int(getattr(traj, "track_length", len(traj.bboxes)))
+        except Exception:
+            try:
+                return int(len(traj.bboxes))
+            except Exception:
+                return 1
+
+    def _get_unmatch_length_exp7(self, traj):
+        for name in ["unmatch_length", "unmatched_length", "lost_time", "lost_frame", "time_since_update"]:
+            if hasattr(traj, name):
+                try:
+                    return int(getattr(traj, name))
+                except Exception:
+                    pass
+        return 0
+
+    def _get_distance_level_exp7(self, dist):
+        cfg = self._get_reliability_tracking_cfg()
+        dist_cfg = cfg.get("DISTANCE_RANGE", {}) if isinstance(cfg.get("DISTANCE_RANGE", {}), dict) else {}
+        near = float(dist_cfg.get("NEAR", 30.0))
+        mid = float(dist_cfg.get("MID", 65.0))
+        if dist < near:
+            return "near"
+        if dist < mid:
+            return "mid"
+        return "far"
+
+    def _get_residual_scale_exp7(self, cls_id, dist_level):
+        cfg = self._get_reliability_tracking_cfg()
+        trs_cfg = cfg.get("TRS", {}) if isinstance(cfg.get("TRS", {}), dict) else {}
+        residual_cfg = trs_cfg.get("RESIDUAL_SCALE", {}) if isinstance(trs_cfg.get("RESIDUAL_SCALE", {}), dict) else {}
+        if dist_level == "near":
+            return float(_cfg_by_cls(residual_cfg.get("NEAR", {0: 2.0}), cls_id, 2.0))
+        if dist_level == "mid":
+            return float(_cfg_by_cls(residual_cfg.get("MID", {0: 4.0}), cls_id, 4.0))
+        return float(_cfg_by_cls(residual_cfg.get("FAR", {0: 6.0}), cls_id, 6.0))
+
+    def _history_quality_exp7(self, traj, cls_id):
+        cfg = self._get_reliability_tracking_cfg()
+        trs_cfg = cfg.get("TRS", {}) if isinstance(cfg.get("TRS", {}), dict) else {}
+        norm_len = float(_cfg_by_cls(trs_cfg.get("HISTORY_NORM_LENGTH", {0: 10}), cls_id, 10.0))
+        track_len = self._get_track_length_exp7(traj)
+        return float(np.clip(track_len / max(norm_len, 1.0), 0.0, 1.0))
+
+    def _match_quality_exp7(self, traj, det_bbox, cls_id):
+        if traj is None or not hasattr(traj, "bboxes") or len(traj.bboxes) == 0:
+            return 0.5, 999.0
+        trk_center = self._get_bbox_center_xy_exp7(traj.bboxes[-1])
+        det_center = self._get_bbox_center_xy_exp7(det_bbox)
+        if trk_center is None or det_center is None:
+            return 0.5, 999.0
+        residual = float(np.linalg.norm(det_center - trk_center))
+        dist = _get_bbox_dist(det_bbox)
+        dist_level = self._get_distance_level_exp7(dist)
+        scale = self._get_residual_scale_exp7(cls_id, dist_level)
+        quality = float(np.exp(-residual / max(scale, 1e-6)))
+        return float(np.clip(quality, 0.0, 1.0)), residual
+
+    def _motion_quality_exp7(self, traj, det_bbox, cls_id):
+        cfg = self._get_reliability_tracking_cfg()
+        trs_cfg = cfg.get("TRS", {}) if isinstance(cfg.get("TRS", {}), dict) else {}
+        default_quality = float(trs_cfg.get("DEFAULT_MOTION_QUALITY", 0.50))
+        if traj is None or not hasattr(traj, "bboxes") or len(traj.bboxes) < 2:
+            return default_quality
+        prev_center = self._get_bbox_center_xy_exp7(traj.bboxes[-2])
+        last_center = self._get_bbox_center_xy_exp7(traj.bboxes[-1])
+        det_center = self._get_bbox_center_xy_exp7(det_bbox)
+        if prev_center is None or last_center is None or det_center is None:
+            return default_quality
+        pred_center = last_center + (last_center - prev_center)
+        err = float(np.linalg.norm(det_center - pred_center))
+        dist = _get_bbox_dist(det_bbox)
+        dist_level = self._get_distance_level_exp7(dist)
+        scale = self._get_residual_scale_exp7(cls_id, dist_level)
+        quality = float(np.exp(-err / max(scale, 1e-6)))
+        return float(np.clip(quality, 0.0, 1.0))
+
+    def _distance_quality_exp7(self, det_bbox):
+        dist = _get_bbox_dist(det_bbox)
+        level = self._get_distance_level_exp7(dist)
+        if level == "near":
+            return 1.0
+        if level == "mid":
+            return 0.80
+        return 0.60
+
+    def _boundary_quality_exp7(self, det_bbox, frame_info=None):
+        cfg = self._get_reliability_tracking_cfg()
+        b_cfg = cfg.get("BOUNDARY", {}) if isinstance(cfg.get("BOUNDARY", {}), dict) else {}
+        info = self._get_bbox_2d_area_info_exp5a(det_bbox, frame_info)
+        if info is None:
+            return 0.80
+        if info.get("area", 0.0) <= 1e-6:
+            return float(b_cfg.get("OUT_OF_VIEW_QUALITY", 0.30))
+        if bool(info.get("touches_boundary", False)):
+            return float(b_cfg.get("NEAR_BOUNDARY_QUALITY", 0.70))
+        return 1.0
+
+    def _infer_motion_state_for_traj_exp7(self, traj):
+        hsm_cfg = self.cfg.get("HSM_LTM", {})
+        motion_cfg = hsm_cfg.get("MOTION_STATE", {}) if isinstance(hsm_cfg.get("MOTION_STATE", {}), dict) else {}
+        cls_id = getattr(traj, "category_num", 0)
+        history_window = int(_cfg_by_cls(hsm_cfg.get("HISTORY_WINDOW", {0: 3}), cls_id, 3))
+        static_disp_thre = float(_cfg_by_cls(motion_cfg.get("STATIC_DISP_THRE", {0: 0.02}), cls_id, 0.02))
+        require_all_static = bool(motion_cfg.get("REQUIRE_ALL_STATIC", True))
+
+        if hasattr(traj, "is_static_before_lost"):
+            try:
+                if traj.is_static_before_lost(
+                    history_len=history_window,
+                    static_disp_thre=static_disp_thre,
+                    require_all_static=require_all_static,
+                ):
+                    return "static"
+            except Exception:
+                pass
+
+        if not hasattr(traj, "bboxes") or len(traj.bboxes) < 2:
+            return "moving"
+        centers = []
+        for bbox in traj.bboxes[-max(history_window + 1, 2):]:
+            center = self._get_bbox_center_xy_exp7(bbox)
+            if center is not None:
+                centers.append(center)
+        if len(centers) < 2:
+            return "moving"
+        disps = [float(np.linalg.norm(centers[i] - centers[i - 1])) for i in range(1, len(centers))]
+        if len(disps) == 0:
+            return "moving"
+        if require_all_static:
+            return "static" if all(d <= static_disp_thre for d in disps) else "moving"
+        return "static" if float(np.mean(disps)) <= static_disp_thre else "moving"
+
+    def _compute_track_reliability_exp7(self, traj, det_bbox, cost_value=None, frame_info=None, source="matched"):
+        cfg = self._get_reliability_tracking_cfg()
+        trs_cfg = cfg.get("TRS", {}) if isinstance(cfg.get("TRS", {}), dict) else {}
+        router_cfg = self._get_reliability_router_cfg()
+        cls_id = getattr(traj, "category_num", _get_traj_cls_id(traj, self.cfg))
+
+        weight_cfg = trs_cfg.get("WEIGHT", {}) if isinstance(trs_cfg.get("WEIGHT", {}), dict) else {}
+        weights = {
+            "score": float(weight_cfg.get("SCORE", 0.25)),
+            "history": float(weight_cfg.get("HISTORY", 0.20)),
+            "match": float(weight_cfg.get("MATCH", 0.25)),
+            "motion": float(weight_cfg.get("MOTION", 0.20)),
+            "distance": float(weight_cfg.get("DISTANCE", 0.10)),
+            # EXP7E: boundary is no longer part of TRS by default.
+            # Boundary/out-of-view is already handled by EXP5A, so keep this at 0 unless explicitly enabled in yaml.
+            "boundary": float(weight_cfg.get("BOUNDARY", 0.00)),
+        }
+
+        score = float(np.clip(_get_bbox_score(det_bbox), 0.0, 1.0))
+        history_q = self._history_quality_exp7(traj, cls_id)
+        # MATCH still uses BEV center residual by default. cost_value is recorded only for debug.
+        match_q, residual = self._match_quality_exp7(traj, det_bbox, cls_id)
+        motion_q = self._motion_quality_exp7(traj, det_bbox, cls_id)
+        distance_q = self._distance_quality_exp7(det_bbox)
+        # If boundary weight is 0, do not let boundary affect TRS.
+        boundary_q = 1.0 if weights["boundary"] <= 1e-12 else self._boundary_quality_exp7(det_bbox, frame_info)
+
+        total_w = max(sum(weights.values()), 1e-6)
+        trs = (
+            weights["score"] * score
+            + weights["history"] * history_q
+            + weights["match"] * match_q
+            + weights["motion"] * motion_q
+            + weights["distance"] * distance_q
+            + weights["boundary"] * boundary_q
+        ) / total_w
+
+        newborn_cfg = trs_cfg.get("NEWBORN_PENALTY", {}) if isinstance(trs_cfg.get("NEWBORN_PENALTY", {}), dict) else {}
+        track_len = self._get_track_length_exp7(traj)
+        if bool(newborn_cfg.get("ENABLE", True)):
+            max_age = int(newborn_cfg.get("MAX_AGE", 3))
+            factor = float(newborn_cfg.get("FACTOR", 0.85))
+            if track_len <= max_age:
+                trs *= factor
+
+        high_thre = float(_cfg_by_cls(router_cfg.get("HIGH_TRS_THRE", {0: 0.75}), cls_id, 0.75))
+        weak_thre = float(_cfg_by_cls(router_cfg.get("WEAK_TRS_THRE", {0: 0.45}), cls_id, 0.45))
+
+        if trs >= high_thre:
+            level = "high"
+            action = "kalman_update"
+        elif trs < weak_thre:
+            level = "weak"
+            action = "nms_suppress"
+        else:
+            level = "medium"
+            action = "motion_state"
+
+        motion_state = self._infer_motion_state_for_traj_exp7(traj) if level == "medium" else "none"
+
+        return {
+            "trs": float(np.clip(trs, 0.0, 1.0)),
+            "level": level,
+            "action": action,
+            "motion_state": motion_state,
+            "score_q": float(score),
+            "history_q": float(history_q),
+            "match_q": float(match_q),
+            "motion_q": float(motion_q),
+            "distance_q": float(distance_q),
+            "boundary_q": float(boundary_q),
+            "residual": float(residual),
+            "dist": float(_get_bbox_dist(det_bbox)),
+            "cost": self._safe_float_exp7(cost_value, 0.0),
+            "match_source": "bev_center_residual",
+            "source": source,
+        }
+
+    def _apply_reliability_meta_exp7(self, traj, route_meta, source="matched"):
+        if traj is None or route_meta is None:
+            return
+        traj.reliability_level = route_meta.get("level", "unknown")
+        traj.reliability_route_action = route_meta.get("action", "unknown")
+        traj.reliability_trs = float(route_meta.get("trs", 0.0))
+        traj.reliability_motion_state = route_meta.get("motion_state", "none")
+        traj.reliability_source = source
+        traj.reliability_is_weak = bool(route_meta.get("level") == "weak")
+
+        if hasattr(traj, "bboxes") and len(traj.bboxes) > 0:
+            bbox = traj.bboxes[-1]
+            bbox.reliability_level = traj.reliability_level
+            bbox.reliability_route_action = traj.reliability_route_action
+            bbox.reliability_trs = traj.reliability_trs
+            bbox.reliability_motion_state = traj.reliability_motion_state
+            bbox.reliability_source = source
+            bbox.reliability_is_weak = traj.reliability_is_weak
+            bbox.reliability_score_q = float(route_meta.get("score_q", 0.0))
+            bbox.reliability_history_q = float(route_meta.get("history_q", 0.0))
+            bbox.reliability_match_q = float(route_meta.get("match_q", 0.0))
+            bbox.reliability_motion_q = float(route_meta.get("motion_q", 0.0))
+            bbox.reliability_distance_q = float(route_meta.get("distance_q", 0.0))
+            bbox.reliability_boundary_q = float(route_meta.get("boundary_q", 0.0))
+            bbox.reliability_match_source = route_meta.get("match_source", "bev_center_residual")
+            bbox.reliability_residual = float(route_meta.get("residual", 999.0))
+            bbox.reliability_dist = float(route_meta.get("dist", 0.0))
+            if traj.reliability_level == "medium":
+                bbox.hsm_motion_state = traj.reliability_motion_state
+                bbox.hsm_action = "motion_state_ready"
+            elif traj.reliability_level == "weak":
+                bbox.hsm_action = "weak_route_output_nms"
+
+    def _update_reliability_router_stats_exp7(self, route_meta, matched=True):
+        if route_meta is None:
+            return
+        if matched:
+            self.reliability_router_stats["matched_checked"] = self.reliability_router_stats.get("matched_checked", 0) + 1
+            level = route_meta.get("level", "unknown")
+            if level == "high":
+                self.reliability_router_stats["high_kalman"] = self.reliability_router_stats.get("high_kalman", 0) + 1
+            elif level == "medium":
+                self.reliability_router_stats["medium_motion_state"] = self.reliability_router_stats.get("medium_motion_state", 0) + 1
+                if route_meta.get("motion_state") == "static":
+                    self.reliability_router_stats["medium_static"] = self.reliability_router_stats.get("medium_static", 0) + 1
+                else:
+                    self.reliability_router_stats["medium_moving"] = self.reliability_router_stats.get("medium_moving", 0) + 1
+            elif level == "weak":
+                self.reliability_router_stats["weak_nms_suppress"] = self.reliability_router_stats.get("weak_nms_suppress", 0) + 1
+
+    def _update_matched_with_reliability_router(self, track_id, det_bbox, cost_value, frame_info=None, source="matched"):
+        traj = self.all_trajs[track_id]
+        route_meta = None
+        if self._reliability_router_enabled():
+            route_meta = self._compute_track_reliability_exp7(
+                traj=traj,
+                det_bbox=det_bbox,
+                cost_value=cost_value,
+                frame_info=frame_info,
+                source=source,
+            )
+            self._update_reliability_router_stats_exp7(route_meta, matched=True)
+
+            # EXP7D：matched 阶段所有轨迹都必须正常 update。
+            # 三层路由只决定 unmatched 后是否进入 HSM/MOTION_STATE，
+            # 以及 weak 是否允许在输出 NMS 阶段被压制。
+
+        traj.update(det_bbox, cost_value)
+
+        if route_meta is not None:
+            self._apply_reliability_meta_exp7(traj, route_meta, source=source)
+            router_cfg = self._get_reliability_router_cfg()
+            if bool(router_cfg.get("DEBUG", False)):
+                print(
+                    "[RELIABILITY_ROUTER_MATCHED]",
+                    "track_id=", track_id,
+                    "frame=", getattr(frame_info, "frame_id", -1) if frame_info is not None else -1,
+                    "source=", source,
+                    "level=", route_meta.get("level"),
+                    "action=", route_meta.get("action"),
+                    "motion_state=", route_meta.get("motion_state"),
+                    "trs=", round(float(route_meta.get("trs", 0.0)), 4),
+                    "score_q=", round(float(route_meta.get("score_q", 0.0)), 4),
+                    "history_q=", round(float(route_meta.get("history_q", 0.0)), 4),
+                    "match_q=", round(float(route_meta.get("match_q", 0.0)), 4),
+                    "residual=", round(float(route_meta.get("residual", 999.0)), 4),
+                )
+
+        return route_meta
+
     def unmatch_update_with_hsm(self, track_id, frame_id, frame_info=None):
+        """
+        EXP7D：可靠性感知的选择性运动状态处理。
+
+        关键边界：
+        1) 所有轨迹都先执行基础 Kalman unmatched 更新，保证生命周期、fake bbox、unmatch_length 不被破坏。
+        2) high 轨迹：基础 Kalman 后直接返回，不进入 HSM_LTM / MOTION_STATE。
+        3) medium 轨迹：基础 Kalman 后进入 MOTION_STATE / HSM_LTM。
+        4) weak 轨迹：基础 Kalman 后直接返回，只给输出阶段 weak-only NMS 提供可压制标签。
+
+        注意：matched 阶段所有轨迹仍然正常 traj.update()，不会因为 weak 而跳过 update。
+        """
         traj = self.all_trajs[track_id]
 
         hsm_cfg = self.cfg.get("HSM_LTM", {})
@@ -1210,11 +1614,33 @@ class Base3DTracker:
 
         cls_id = getattr(traj, "category_num", 0)
 
-        is_static_before_lost = False
+        router_enabled = self._reliability_router_enabled()
+        router_cfg = self._get_reliability_router_cfg() if router_enabled else {}
+        default_level = str(router_cfg.get("DEFAULT_UNMATCHED_LEVEL", "medium")).lower()
+        if default_level not in ["high", "medium", "weak"]:
+            default_level = "medium"
 
-        # 必须在 unmatch_update() 前判断
-        # 因为 unmatch_update() 会追加 Kalman fake bbox
-        if motion_state_enable:
+        if router_enabled:
+            route_level = str(getattr(traj, "reliability_level", default_level)).lower()
+            if route_level not in ["high", "medium", "weak"]:
+                route_level = default_level
+            if not hasattr(traj, "reliability_level"):
+                self.reliability_router_stats["unmatched_unknown_default_medium"] = (
+                    self.reliability_router_stats.get("unmatched_unknown_default_medium", 0) + 1
+                )
+        else:
+            # 关闭 EXP7D 时完全退回原始行为：所有轨迹允许进入 HSM_LTM。
+            route_level = "medium"
+
+        route_trs = float(getattr(traj, "reliability_trs", 0.0))
+
+        # ------------------------------------------------------------
+        # 必须在 traj.unmatch_update() 前判断静止状态。
+        # 因为 unmatch_update() 会追加 Kalman fake bbox，追加后再判断会污染历史位移。
+        # 只有 medium 轨迹需要 MOTION_STATE / HSM_LTM，所以只为 medium 计算。
+        # ------------------------------------------------------------
+        is_static_before_lost = False
+        if route_level == "medium" and motion_state_enable:
             history_window = int(
                 _cfg_by_cls(
                     hsm_cfg.get("HISTORY_WINDOW", {0: 3}),
@@ -1231,9 +1657,7 @@ class Base3DTracker:
                 )
             )
 
-            require_all_static = bool(
-                motion_cfg.get("REQUIRE_ALL_STATIC", True)
-            )
+            require_all_static = bool(motion_cfg.get("REQUIRE_ALL_STATIC", True))
 
             is_static_before_lost = traj.is_static_before_lost(
                 history_len=history_window,
@@ -1241,9 +1665,72 @@ class Base3DTracker:
                 require_all_static=require_all_static,
             )
 
-        # 原始 Kalman unmatched 更新
+        # ------------------------------------------------------------
+        # 所有轨迹都必须走基础 Kalman unmatched 更新。
+        # 这一步负责 fake bbox、unmatch_length、生命周期等基础逻辑。
+        # ------------------------------------------------------------
         traj.unmatch_update(frame_id)
 
+        # 给刚生成的 fake bbox 写入可靠性标签，供最终输出 NMS 使用。
+        if router_enabled:
+            if route_level == "high":
+                self.reliability_router_stats["unmatched_high_kalman_only"] = (
+                    self.reliability_router_stats.get("unmatched_high_kalman_only", 0) + 1
+                )
+                route_meta = {
+                    "level": "high",
+                    "action": "kalman_unmatched_only",
+                    "motion_state": "none",
+                    "trs": route_trs,
+                    "source": "unmatched_high_kalman_only",
+                }
+                self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_high_kalman_only")
+
+            elif route_level == "weak":
+                self.reliability_router_stats["unmatched_weak_nms_only"] = (
+                    self.reliability_router_stats.get("unmatched_weak_nms_only", 0) + 1
+                )
+                route_meta = {
+                    "level": "weak",
+                    "action": "kalman_unmatched_nms_only",
+                    "motion_state": "none",
+                    "trs": route_trs,
+                    "source": "unmatched_weak_nms_only",
+                }
+                self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_weak_nms_only")
+
+            else:
+                self.reliability_router_stats["unmatched_medium_motion_state_hsm"] = (
+                    self.reliability_router_stats.get("unmatched_medium_motion_state_hsm", 0) + 1
+                )
+                route_meta = {
+                    "level": "medium",
+                    "action": "motion_state_hsm_after_kalman_unmatched",
+                    "motion_state": "static" if is_static_before_lost else "moving",
+                    "trs": route_trs,
+                    "source": "unmatched_medium_motion_state_hsm",
+                }
+                self._apply_reliability_meta_exp7(traj, route_meta, source="unmatched_medium_motion_state_hsm")
+
+        # ------------------------------------------------------------
+        # EXP7D 路由分流：
+        # high：只信任基础 Kalman 预测，不进入 HSM_LTM / MOTION_STATE。
+        # weak：不使用 HSM_LTM 救轨迹，只把 weak 标签交给最终 NMS。
+        # medium：才继续进入 HSM_LTM / MOTION_STATE。
+        # ------------------------------------------------------------
+        if router_enabled and route_level == "high":
+            if len(traj.bboxes) > 0:
+                traj.bboxes[-1].hsm_motion_state = "none"
+                traj.bboxes[-1].hsm_action = "exp7d_high_kalman_only"
+            return
+
+        if router_enabled and route_level == "weak":
+            if len(traj.bboxes) > 0:
+                traj.bboxes[-1].hsm_motion_state = "none"
+                traj.bboxes[-1].hsm_action = "exp7d_weak_nms_only"
+            return
+
+        # 关闭 HSM 时，medium 也只保留基础 Kalman unmatched。
         if not hsm_enable:
             return
 
@@ -1258,24 +1745,27 @@ class Base3DTracker:
         if traj.unmatch_length < start_unmatch_length:
             return
 
-        # 静止目标：不进入原 HSM_LTM 群体运动审查。
-        # 仅在这里额外做“自车运动引导的静止车辆出界判断”。
-        # 注意：这个逻辑只可能删除已经出界的静止轨迹，不改 GROUP_MOTION。
+        # ------------------------------------------------------------
+        # 只有 medium 轨迹进入这里。
+        # 静止 medium：不进群体运动，用静止自车参考框 / Kalman-only 检查。
+        # 运动 medium：沿用原 HSM_LTM 审查 / 修正逻辑。
+        # ------------------------------------------------------------
         if motion_state_enable and is_static_before_lost:
             ego_preserved = self._apply_static_ego_exit_exp5a(
                 traj,
                 frame_info=frame_info,
-                source="unmatched_static_ego",
+                source="unmatched_medium_static_ego",
             )
 
             if motion_cfg.get("DEBUG", False):
                 print(
-                    "[HSM_LTM][MOTION_STATE]",
+                    "[HSM_LTM][MOTION_STATE][EXP7D_MEDIUM]",
                     "track_id=", track_id,
                     "frame=", frame_id,
                     "state=static",
                     "action=static_ego_refbox_preserved" if ego_preserved else "kalman_only_static_ego_checked",
                     "unmatch_length=", traj.unmatch_length,
+                    "trs=", round(float(route_trs), 4),
                 )
 
             if len(traj.bboxes) > 0:
@@ -1284,20 +1774,20 @@ class Base3DTracker:
 
             return
 
-        # 运动目标：沿用原 HSM_LTM 审查/删除逻辑
         if motion_state_enable:
             if len(traj.bboxes) > 0:
                 traj.bboxes[-1].hsm_motion_state = "moving"
-                traj.bboxes[-1].hsm_action = "original_hsm_ltm"
+                traj.bboxes[-1].hsm_action = "original_hsm_ltm_medium_only"
 
             if motion_cfg.get("DEBUG", False):
                 print(
-                    "[HSM_LTM][MOTION_STATE]",
+                    "[HSM_LTM][MOTION_STATE][EXP7D_MEDIUM]",
                     "track_id=", track_id,
                     "frame=", frame_id,
                     "state=moving",
                     "action=original_hsm_ltm",
                     "unmatch_length=", traj.unmatch_length,
+                    "trs=", round(float(route_trs), 4),
                 )
 
         hsm_after_unmatch_update(
@@ -1305,6 +1795,7 @@ class Base3DTracker:
             all_trajs=self.all_trajs,
             cfg=self.cfg,
         )
+
     def get_trajectory_bbox(self, all_trajs):
         track_ids = sorted(all_trajs.keys())
         trajs = []
@@ -1407,8 +1898,12 @@ class Base3DTracker:
             track_id = trajs[i].track_id
             if i in match_res[:, 0]:
                 indexes = np.where(match_res[:, 0] == i)[0]
-                self.all_trajs[track_id].update(
-                    frame_info.bboxes[match_res[indexes, 1][0]], cost_matrix[indexes][0]
+                self._update_matched_with_reliability_router(
+                    track_id=track_id,
+                    det_bbox=frame_info.bboxes[match_res[indexes, 1][0]],
+                    cost_value=cost_matrix[indexes][0],
+                    frame_info=frame_info,
+                    source="matched_bev",
                 )
                 self.all_trajs[track_id].exp5a_static_ego_finished = False
                 self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
@@ -1469,8 +1964,12 @@ class Base3DTracker:
                     if diff_rot > 90 or dist > 5:
                         self.unmatch_update_with_hsm(track_id, frame_info.frame_id, frame_info)
                         continue
-                    self.all_trajs[track_id].update(
-                        det_bbox, float(cost_matrix_inbev[indexes])
+                    self._update_matched_with_reliability_router(
+                        track_id=track_id,
+                        det_bbox=det_bbox,
+                        cost_value=float(cost_matrix_inbev[indexes]),
+                        frame_info=frame_info,
+                        source="matched_rv",
                     )
                     self.all_trajs[track_id].exp5a_static_ego_finished = False
                     self.all_trajs[track_id].exp5a_static_ego_keep_len = 0
@@ -1642,6 +2141,15 @@ class Base3DTracker:
 
             # 静止自车参考框延伸也记录下来，方便后面保护
             bbox.output_static_ego_preserved = bool(static_ego_preserved)
+
+            # EXP7：把三层路由结果传给输出阶段 NMS。
+            # detection_quality_filter.py 若支持这些字段，就可以只压制 weak 轨迹；
+            # 若旧版本未读取这些字段，也不会破坏原有输出逻辑。
+            bbox.output_reliability_level = getattr(traj, "reliability_level", getattr(bbox, "reliability_level", "unknown"))
+            bbox.output_reliability_action = getattr(traj, "reliability_route_action", getattr(bbox, "reliability_route_action", "unknown"))
+            bbox.output_reliability_trs = float(getattr(traj, "reliability_trs", getattr(bbox, "reliability_trs", 0.0)))
+            bbox.output_reliability_is_weak = bool(bbox.output_reliability_level == "weak")
+            bbox.output_allow_nms_suppress = bool(bbox.output_reliability_is_weak and not already_confirmed)
 
             output_trajs[track_id] = bbox
             traj.is_output = True

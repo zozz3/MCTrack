@@ -67,7 +67,7 @@ THRESHOLD:
   COST_STATE_PREDICT_RATION: {0: 0.5}
   BEV:
     #匹配阈值
-    COST_THRE: {0: 1.26}
+    COST_THRE: {0: 1.28}
     # Notes: You need to ensure that w1 + w2 = 2 , otherwise you will need to readjust the threshold of RO_GDIOU.
     WEIGHT_RO_GDIOU: {0: {"w1": 1.0, "w2": 1.0}}
   RV:
@@ -84,9 +84,9 @@ THRESHOLD:
     CONFIRMED_TRACK_LENGTH: {0: 1}
     DELET_OUT_VIEW_LENGTH: {0: 0}
     #判断轨迹是否足够可靠检测框本身分数高
-    CONFIRMED_DET_SCORE: {0: 0.4}
-    #不输出纯预测轨迹的框
-    IS_FILTER_PREDICT_BOX: {0: 0.1}
+    CONFIRMED_DET_SCORE: {0: 0.7}
+    #给没有真实检测支撑的预测框打一个特殊 det_score 标记，
+    IS_FILTER_PREDICT_BOX: {0: 0}
     #匹配质量还可以
     CONFIRMED_MATCHED_SCORE: {0: 0.3}
 
@@ -152,7 +152,7 @@ KALMAN_FILTER_RVBOX:
 HSM_LTM:
   ENABLE: True
   # 回看丢失前几帧
-  HISTORY_WINDOW: {0: 3}
+  HISTORY_WINDOW: {0: 5}
   # 第几帧丢失开始启用审查，1 表示第一次 unmatched 后就启用
   START_UNMATCH_LENGTH: {0: 1}
   # 新增：运动状态感知分支
@@ -184,9 +184,9 @@ HSM_LTM:
     MIN_DET_SCORE: {0: 0.7}
     MIN_TRACK_LENGTH: {0: 5}
     MIN_SPEED: {0: 0.5}
-    MAX_DISTANCE: {0: 18.0}
-    MAX_DIR_DIFF_DEG: {0: 25.0}
-    MAX_SPEED_REL_DIFF: {0: 0.45}
+    MAX_DISTANCE: {0: 22.0}
+    MAX_DIR_DIFF_DEG: {0: 30.0}
+    MAX_SPEED_REL_DIFF: {0: 0.55}
   # 参考车辆选择方式
   SELECTION:
     MODE: "TOPK_WEIGHTED_RANDOM"   # TOPK / RANDOM / TOPK_WEIGHTED_RANDOM
@@ -203,18 +203,14 @@ HSM_LTM:
 
   PREDICTION:
     ENABLE: True
-
     # CHECK_ONLY = 原来的 HSM_LTM，只审查不修正
     # BLEND_GROUP = 用群体运动轻量修正 Kalman fake bbox
     MODE: "BLEND_GROUP"
-
     # 先保守一点，别上来太大
     GROUP_BLEND_ALPHA: {0: 0.2}
-
     # 只有位置误差没有超过阈值时才融合
     ONLY_BLEND_WHEN_POS_NORMAL: True
-
-    DEBUG: False
+    DEBUG: True
 
 # ---------------- group motion switch for exp2 ----------------
 GROUP_MOTION:
@@ -253,23 +249,37 @@ OUTPUT_TRAJ_NMS:
   # 当前框面积比邻居平均面积大多少，认为像桥接误检
   LARGE_AREA_RATIO: 1.08
   # 桥接惩罚，降低它的 NMS 排序分数
-  BRIDGE_SCORE_PENALTY: 0.32
+  BRIDGE_SCORE_PENALTY: 0.2
 
  # ---------------- 实验2：生命周期感知保护 ----------------
   LIFECYCLE_AWARE: True
 
   # 已经稳定输出过的老轨迹，不允许被 NMS 压掉
   PROTECT_CONFIRMED_TRACKS: True
-  CONFIRMED_MIN_TRACK_LENGTH: {0: 5}
+  CONFIRMED_MIN_TRACK_LENGTH: {0: 10}
   CONFIRMED_MAX_UNMATCH_LENGTH: {0: 0}
 
   # NMS 只允许压制弱轨迹
   SUPPRESS_ONLY_WEAK_TRACKS: True
-  SHORT_TRACK_LENGTH: {0: 3}
+  SHORT_TRACK_LENGTH: {0: 2}
   LOW_SCORE_THRE: {0: 0.45}
 
+  # EXP7D / EXP7E：weak-only 输出 NMS。
+  # 只在最终输出阶段压制 weak 轨迹，不删除轨迹，不改 Kalman，不改 HSM_LTM。
+  WEAK_ONLY_PRE_SUPPRESS: True
+  # weak 与 strong 参考框重叠达到这些条件之一，才压制 weak。
+  # 当前 weak 数量和 suppressed 都偏少，所以这里比原 NMS 阈值稍放宽。
+  WEAK_REF_IOU_THRE: {0: 0.30}
+  WEAK_COVER_RATIO_THRE: {0: 0.60}
+  WEAK_CONTAIN_RATIO_THRE: {0: 0.75}
+  WEAK_BRIDGE_SUPPRESS: True
+  WEAK_MIN_STRONG_NEIGHBORS: {0: 2}
+  WEAK_BRIDGE_LARGE_AREA_RATIO: {0: 1.08}
+  # 保守：已经确认输出过的老轨迹，即使被标成 weak，也先不允许被压。
+  ALLOW_CONFIRMED_WEAK_SUPPRESS: False
+
   DEBUG: False
-  PRINT_SUMMARY: True
+  PRINT_SUMMARY: False
 
 OUTPUT_FILTER:
   ENABLE: True
@@ -304,7 +314,7 @@ EXP5A_OUT_OF_VIEW:
     PRINT_SUMMARY: False
 
     # 核心阈值：裁剪后剩余面积 <= 最大完整框面积的 10%，停止输出
-    STOP_REMAIN_RATIO_THRE: {0: 0.01}
+    STOP_REMAIN_RATIO_THRE: {0: 0.07}
     # 只给已经确认输出过的老轨迹做静止延伸
     REQUIRE_ALREADY_OUTPUT: True
     # 给延伸框一个正常输出分数，避免被普通 fake bbox 分数过滤
@@ -330,3 +340,63 @@ NEWBORN_OCCLUSION_SUPPRESS:
   MIN_AREA: 40
   DEBUG: False
   PRINT_SUMMARY: False
+RELIABILITY_AWARE_TRACKING:
+  ENABLE: True
+  DEBUG: False
+
+  # EXP7D：三层轨迹质量路由。
+  # 代码只有在 ROUTER.ENABLE=True 时才会真正执行 high / medium / weak 分流。
+  ROUTER:
+    ENABLE: True
+    # TRS >= HIGH_TRS_THRE：高质量轨迹，只走基础 Kalman unmatched，不进 HSM_LTM。
+    HIGH_TRS_THRE: {0: 0.75}
+    # TRS < WEAK_TRS_THRE：弱轨迹，只打 NMS 可压制标签，不进 HSM_LTM。
+    # 0.45 太保守，weak 数量太少；先用 0.55 让 weak-only NMS 有候选。
+    WEAK_TRS_THRE: {0: 0.55}
+    # matched 阶段所有轨迹都正常 update，不跳过 weak update，避免 FN 暴涨。
+    WEAK_UPDATE_MODE: "NORMAL_UPDATE_MARK_WEAK"
+    # unmatched 但没有历史 reliability 标签时，默认按中质量处理，避免漏进 MOTION_STATE。
+    DEFAULT_UNMATCHED_LEVEL: "medium"
+    PRINT_SUMMARY: False
+    DEBUG: False
+
+
+  DISTANCE_RANGE:
+    NEAR: 30.0
+    MID: 65.0
+
+  TRS:
+    ENABLE: True
+    NEWBORN_PENALTY:
+      ENABLE: True
+      MAX_AGE: 2
+      FACTOR: 0.65
+
+    WEIGHT:
+      SCORE: 0.25
+      HISTORY: 0.20
+      MATCH: 0.25
+      MOTION: 0.20
+      DISTANCE: 0.10
+      BOUNDARY: 0.00
+
+    HISTORY_NORM_LENGTH: 10
+
+    RESIDUAL_SCALE:
+      NEAR: 2.0
+      MID: 4.0
+      FAR: 6.0
+
+    DEFAULT_DET_SCORE: 0.30
+    DEFAULT_MOTION_QUALITY: 0.50
+
+  BOUNDARY:
+    IMAGE_WIDTH: 1242
+    IMAGE_HEIGHT: 375
+    BOUNDARY_MARGIN: 5
+    NEAR_BOUNDARY_QUALITY: 0.70
+    OUT_OF_VIEW_QUALITY: 0.30
+
+  LOG:
+    ENABLE: True
+    PRINT_INTERVAL: 200
