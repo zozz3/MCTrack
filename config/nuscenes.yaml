@@ -7,7 +7,7 @@ DATASET: "nuscenes"
 # dataset info
 SPLIT: "val" # val, test
 DETECTOR: centerpoint  # centerpoint, largekernel
-DATASET_ROOT: "data/nuscenes/datasets/" 
+DATASET_ROOT: "data/base_version/nuscenes/"
 DETECTIONS_ROOT: "data/base_version/nuscenes/"
 SAVE_PATH: "results/"
 TRACKING_MODE: 'ONLINE' # ONLINE / GLOBAL
@@ -251,3 +251,99 @@ KALMAN_FILTER_RVBOX:
         P: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         Q: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
         R: [2.0, 2.0, 2.0, 2.0]
+
+# ============================================================
+# nuScenes conservative migration from KITTI-style improvements
+# This config is designed for base_tracker_nuscenes_mod.py.
+# First ablation version: enable only low-risk modules.
+# ============================================================
+
+TRACK_AWARE_LOW_SCORE_GATE:
+  ENABLE: False
+  NORMAL_SCORE_THRE: {0: 0.25, 1: 0.28, 2: 0.30, 3: 0.28, 4: 0.25, 5: 0.22, 6: 0.20}
+  LOW_SCORE_THRE:    {0: 0.10, 1: 0.12, 2: 0.15, 3: 0.12, 4: 0.10, 5: 0.10, 6: 0.00}
+  WEAK_DET_CREATE_NEW_TRACK: False
+
+OUTPUT_FILTER:
+  ENABLE: False
+  MIN_OUTPUT_TRACK_LENGTH: {0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2}
+  MIN_OUTPUT_SCORE: {0: 0.22, 1: 0.25, 2: 0.28, 3: 0.25, 4: 0.22, 5: 0.20, 6: 0.18}
+  FAR_DIST: {0: 50.0, 1: 40.0, 2: 40.0, 3: 40.0, 4: 50.0, 5: 50.0, 6: 50.0}
+  FAR_MIN_OUTPUT_SCORE: {0: 0.28, 1: 0.32, 2: 0.35, 3: 0.32, 4: 0.28, 5: 0.25, 6: 0.22}
+  MAX_LOST_OUTPUT_LENGTH: {0: 1, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1, 6: 1}
+  SHORT_TRAJ_LENGTH: {0: 3, 1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3}
+  SHORT_TRAJ_AVG_SCORE: {0: 0.25, 1: 0.30, 2: 0.32, 3: 0.30, 4: 0.25, 5: 0.25, 6: 0.22}
+  DEBUG: False
+
+NUSCENES_BEV_OUTPUT_FILTER:
+  ENABLE: False
+  ONLY_FILTER_FAKE_BBOX: True
+  RANGE_MARGIN: 2.0
+  MAX_OUTPUT_RANGE: {0: 52.0, 1: 42.0, 2: 42.0, 3: 42.0, 4: 52.0, 5: 52.0, 6: 52.0}
+
+# Optional. Keep disabled for the first run because NMS can easily increase IDS
+# if it suppresses stable tracks. Enable only in the second ablation.
+OUTPUT_TRAJ_NMS:
+  ENABLE: False
+  SUPPRESS_ONLY_WEAK_TRACKS: True
+  IOU_THRE: {0: 0.55, 1: 0.40, 2: 0.45, 3: 0.45, 4: 0.60, 5: 0.60, 6: 0.58}
+  CENTER_DIST_THRE: {0: 0.8, 1: 0.4, 2: 0.5, 3: 0.5, 4: 1.0, 5: 1.0, 6: 0.9}
+  SHORT_TRACK_LENGTH: {0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2}
+  LOW_SCORE_THRE: {0: 0.25, 1: 0.28, 2: 0.30, 3: 0.28, 4: 0.25, 5: 0.25, 6: 0.22}
+
+DISTANCE_AWARE_SCORE:
+  ENABLE: True
+
+  DISTANCE_SOURCE: "EGO_BEV"
+  WARN_ON_MISSING_EGO_TRANSFORM: True
+
+  # Independent stage switches.
+  APPLY_NEW_TRACK_INIT: True
+  APPLY_TENTATIVE_OUTPUT: False
+
+  # Used only when APPLY_TENTATIVE_OUTPUT: True.
+  # This field is independent from OUTPUT_FILTER.SHORT_TRAJ_LENGTH.
+  TENTATIVE_MAX_TRACK_LENGTH: {0: 3, 1: 3, 2: 3, 3: 3, 4: 3, 5: 3, 6: 3}
+
+  # Optional independent absolute floor for new-track creation.
+  # Leave this section absent for the cleanest distance-only experiment.
+  # NEW_TRACK_HARD_FLOOR: {0: 0.15, 1: 0.16, 4: 0.16}
+
+  DEBUG: False
+  DEBUG_MAX_PRINTS: 50
+
+  # First clean ablation: only car / pedestrian / bus are enabled.
+  APPLY_CLASSES: {0: True, 1: True, 2: True, 3: True, 4: True, 5: True, 6: True}
+
+  # [near_start, mid_start, far_start, max_range], unit: metre.
+  DISTANCE_BINS:
+    0: [0.0, 15.0, 40.0, 52.0]  # car
+    1: [0.0, 15.0, 25.0, 52.0]  # pedestrian
+    2: [0.0, 10.0, 40.0, 52.0]  # bicycle, disabled
+    3: [0.0, 10.0, 20.0, 52.0]  # motorcycle, disabled
+    4: [0.0, 15.0, 35.0, 52.0]  # bus
+    5: [0.0, 25.0, 45.0, 52.0]  # trailer, disabled
+    6: [0.0, 10.0, 20.0, 52.0]  # truck, disabled
+
+  # Pure far-only relaxed birth gate:
+  # near / mid use the original ONLINE input threshold;
+  # only the far bin is raised slightly.
+  NEW_TRACK_INIT_SCORE:
+    0: [0.15, 0.15, 0.17]  # car
+    1: [0.16, 0.16, 0.20]  # pedestrian
+    2: [0.20, 0.20, 0.20]  # bicycle, disabled
+    3: [0.15, 0.15, 0.15]  # motorcycle, disabled
+    4: [0.16, 0.16, 0.20]  # bus
+    5: [0.17, 0.17, 0.17]  # trailer, disabled
+    6: [0.00, 0.00, 0.00]  # truck, disabled
+
+  # Not active in this run because APPLY_TENTATIVE_OUTPUT: False.
+  # Keep this for the later output-only ablation.
+  TENTATIVE_OUTPUT_SCORE:
+    0: [0.15, 0.15, 0.21]  # car
+    1: [0.16, 0.16, 0.22]  # pedestrian
+    2: [0.20, 0.20, 0.20]  # bicycle, disabled
+    3: [0.15, 0.15, 0.15]  # motorcycle, disabled
+    4: [0.16, 0.16, 0.22]  # bus
+    5: [0.17, 0.17, 0.17]  # trailer, disabled
+    6: [0.00, 0.00, 0.00]  # truck, disabled
